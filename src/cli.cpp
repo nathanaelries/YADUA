@@ -204,6 +204,62 @@ static std::wstring SuffixedPath(const std::wstring& path, const ScanResult& r,
     return path.substr(0, dot) + suffix + path.substr(dot);
 }
 
+// Resolve "C:\foo\bar" to its node index by descending the child index.
+static uint32_t FindNodeByPath(const ScanResult& r, const std::wstring& path) {
+    uint32_t cur = (uint32_t)kRootRecord;
+    size_t pos = path.find(L'\\');
+    while (pos != std::wstring::npos && cur != UINT32_MAX) {
+        size_t end = path.find(L'\\', pos + 1);
+        std::wstring part = path.substr(pos + 1, (end == std::wstring::npos
+                                                      ? path.size() : end) - pos - 1);
+        pos = end;
+        if (part.empty()) continue;
+        uint32_t next = UINT32_MAX;
+        for (uint32_t c = r.Children.Offset[cur]; c < r.Children.Offset[cur + 1]; ++c) {
+            uint32_t child = r.Children.List[c];
+            if (r.Exists(child) && _wcsicmp(r.Name(child).c_str(), part.c_str()) == 0) {
+                next = child;
+                break;
+            }
+        }
+        cur = next;
+    }
+    return cur;
+}
+
+// Hidden self-test for RescanSubtree: scan the drive, splice-rescan the given
+// folder, and report subtree + volume totals before and after.
+static int DebugRescan(const std::wstring& path, unsigned threads) {
+    ScanResult r;
+    std::wstring error;
+    if (!ScanWithProgress(path.substr(0, 2), threads, r, error)) {
+        fprintf(stderr, "error: %s\n", Utf8(error).c_str());
+        return 1;
+    }
+    auto report = [&](const char* when) {
+        uint32_t node = FindNodeByPath(r, path);
+        if (node == UINT32_MAX) {
+            fprintf(stderr, "%s: path not found in scan\n", when);
+            return false;
+        }
+        printf("%s: subtree size=%llu alloc=%llu files=%llu dirs=%llu | "
+               "volume size=%llu files=%llu folders=%llu\n",
+               when, r.Totals[node].LogicalSize, r.Totals[node].AllocatedSize,
+               r.Totals[node].FileCount, r.Totals[node].DirCount,
+               r.Totals[kRootRecord].LogicalSize, r.FileCount, r.DirCount);
+        return true;
+    };
+    if (!report("before")) return 1;
+    uint32_t node = FindNodeByPath(r, path);
+    std::wstring err;
+    if (!RescanSubtree(r, node, err)) {
+        fprintf(stderr, "rescan failed: %s\n", Utf8(err).c_str());
+        return 1;
+    }
+    if (!report("after ")) return 1;
+    return 0;
+}
+
 // ============================================================================
 // main
 // ============================================================================
@@ -223,6 +279,8 @@ int wmain(int argc, wchar_t** argv) {
         else if (arg == L"--json" && i + 1 < argc)    jsonPath = argv[++i];
         else if (arg == L"--threads" && i + 1 < argc) threads = _wtoi(argv[++i]);
         else if (arg == L"--all")                     exportAll = true;
+        else if (arg == L"--debug-rescan" && i + 1 < argc) // hidden self-test
+            return DebugRescan(argv[++i], threads);
         else if (arg == L"--help" || arg == L"-h") {
             printf("Usage: yadua.exe [drives...] [options]\n"
                    "  drives       volumes to scan, e.g. C: D: (default C:)\n"

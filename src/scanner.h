@@ -126,6 +126,18 @@ bool ScanVolumeAuto(const std::wstring& drive, unsigned threads,
                     ScanResult& out, std::wstring& error,
                     ScanProgress* progress = nullptr);
 
+// Recomputes FileCount/DirCount, cumulative totals, and the child index from
+// Nodes — call after in-place modifications (deletion, subtree rescan).
+void Reindex(ScanResult& r);
+
+// Re-enumerates one directory's subtree with a filesystem walk and splices
+// the fresh nodes into the result, then runs Reindex. The rescanned part's
+// allocated sizes become cluster-rounded estimates (the walk can't see the
+// MFT), and hard links inside it count once per link. Not allowed on
+// reparse-point directories.
+bool RescanSubtree(ScanResult& r, uint32_t dir, std::wstring& error,
+                   ScanProgress* progress = nullptr);
+
 // Formatting helpers shared by the frontends.
 std::string  Utf8(const std::wstring& w);
 std::wstring Wide(const std::string& s);

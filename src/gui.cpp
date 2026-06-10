@@ -89,6 +89,15 @@ struct App {
     int               DeleteResult  = 0;    // SHFileOperation return code
     bool              DeleteAborted = false;
     std::string       Status;               // last action feedback, UTF-8
+
+    // Per-folder rescan. The worker mutates Result in place, so the UI must
+    // not read Result while RescanBusy is set (DrawUi gates on it).
+    bool                Rescanning = false;
+    std::atomic<bool>   RescanDone{false};
+    std::thread         RescanThread;
+    std::wstring        RescanPath;  // for the progress display
+    std::wstring        RescanError; // written by the worker before RescanDone
+    yadua::ScanProgress RescanProgress;
 };
 
 // All fixed drives: NTFS gets the fast MFT scan, anything else (or a
@@ -105,7 +114,8 @@ static void ListFixedDrives(App& app) {
 }
 
 static void StartScan(App& app) {
-    if (app.Scanning || app.Deleting || app.Drives.empty()) return;
+    if (app.Scanning || app.Deleting || app.Rescanning || app.Drives.empty())
+        return;
     if (app.ScanThread.joinable()) app.ScanThread.join();
     app.Pending = std::make_unique<yadua::ScanResult>();
     app.Progress.BytesRead  = 0;
@@ -281,8 +291,23 @@ static void ApplySort(App& app, const ImGuiTableColumnSortSpecs& spec) {
 // Deletion (Recycle Bin)
 // ============================================================================
 
+static void StartRescan(App& app, uint32_t node) {
+    if (app.Rescanning || app.Scanning || app.Deleting || !app.Result) return;
+    if (app.RescanThread.joinable()) app.RescanThread.join();
+    app.RescanPath  = app.Result->Path(node);
+    app.RescanError.clear();
+    app.RescanDone  = false;
+    app.Rescanning  = true;
+    app.RescanThread = std::thread([&app, node] {
+        std::wstring err;
+        if (!yadua::RescanSubtree(*app.Result, node, err, &app.RescanProgress))
+            app.RescanError = err;
+        app.RescanDone = true;
+    });
+}
+
 static void StartDelete(App& app, uint32_t node) {
-    if (app.Deleting || app.Scanning || !app.Result) return;
+    if (app.Deleting || app.Scanning || app.Rescanning || !app.Result) return;
     if (app.DeleteThread.joinable()) app.DeleteThread.join();
     app.DeleteNode   = node;
     app.DeletePath   = app.Result->Path(node);
@@ -397,6 +422,11 @@ static void NodeMenuItems(App& app, const yadua::ScanResult& r, uint32_t idx,
             app.SwitchToTreemap = true;
         }
     }
+    if (r.IsDir(idx) && !(r.Nodes[idx].Flags & yadua::kNodeReparse)) {
+        ImGui::BeginDisabled(app.Scanning || app.Deleting || app.Rescanning);
+        if (ImGui::MenuItem("Rescan folder")) StartRescan(app, idx);
+        ImGui::EndDisabled();
+    }
     ImGui::Separator();
     if (ImGui::MenuItem("Open in Explorer")) {
         std::wstring args = L"/select,\"" + r.Path(idx) + L"\"";
@@ -454,7 +484,13 @@ static void DrawTree(App& app, const yadua::ScanResult& r, uint32_t idx,
     std::string label = isRoot ? yadua::Utf8(r.Drive) : yadua::Utf8(r.Name(idx));
     if (r.Nodes[idx].Flags & yadua::kNodeReparse)
         label += "  [link]"; // junction / symlink / cloud placeholder
+    // Tint file names by extension with the same hue the treemap uses, so
+    // the two views read consistently.
+    if (!isDir)
+        ImGui::PushStyleColor(ImGuiCol_Text,
+                              ExtensionColor(r, idx, 0.40f, 0.95f));
     bool open = ImGui::TreeNodeEx((void*)(intptr_t)idx, flags, "%s", label.c_str());
+    if (!isDir) ImGui::PopStyleColor();
     if (idx == app.RevealNode) ImGui::SetScrollHereY(0.35f);
     if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) app.SelectedNode = idx;
     if (ImGui::BeginPopupContextItem()) {
@@ -588,7 +624,7 @@ static void DrawUi(App& app) {
                           "  *.iso        extension filter (or ext:iso)\n"
                           "  >100mb <2gb  size filter (b/kb/mb/gb/tb)");
 
-    if (app.Result) {
+    if (app.Result && !app.Rescanning) {
         ImGui::SameLine();
         ImGui::TextDisabled("| %llu files, %llu folders, %s  (scanned in %.2f s%s)",
                             app.Result->FileCount, app.Result->DirCount,
@@ -612,7 +648,18 @@ static void DrawUi(App& app) {
     ImGui::Separator();
 
     // ---- Body ---------------------------------------------------------------
-    if (app.Scanning) {
+    if (app.Rescanning) {
+        // The worker is mutating Result in place: render nothing that reads it.
+        uint64_t found = app.RescanProgress.BytesRead.load(std::memory_order_relaxed);
+        int stage = app.RescanProgress.Stage.load(std::memory_order_relaxed);
+        ImGui::NewLine();
+        ImGui::Text("Rescanning %s ...", yadua::Utf8(app.RescanPath).c_str());
+        char overlay[64];
+        snprintf(overlay, sizeof(overlay), "%llu entries", found);
+        ImGui::ProgressBar(stage >= yadua::ScanProgress::Aggregating
+                               ? 1.0f : -1.0f * (float)ImGui::GetTime(),
+                           ImVec2(ImGui::GetFontSize() * 25.0f, 0.0f), overlay);
+    } else if (app.Scanning) {
         int stage = app.Progress.Stage.load(std::memory_order_relaxed);
         uint64_t read  = app.Progress.BytesRead.load(std::memory_order_relaxed);
         uint64_t total = app.Progress.TotalBytes.load(std::memory_order_relaxed);
@@ -644,19 +691,20 @@ static void DrawUi(App& app) {
                            yadua::Utf8(app.Error).c_str());
     } else if (app.Result) {
         if (ImGui::BeginTabBar("views")) {
-            ImGuiTabItemFlags treeFlags = 0;
-            if (app.SwitchToTree) { treeFlags = ImGuiTabItemFlags_SetSelected;
-                                    app.SwitchToTree = false; }
-            if (ImGui::BeginTabItem("Tree", nullptr, treeFlags)) {
+            // Keep requesting SetSelected until the target tab actually shows
+            // (a request consumed on the tab bar's very first frame can get
+            // lost before the bar settles), then clear the flag.
+            if (ImGui::BeginTabItem("Tree", nullptr,
+                                    app.SwitchToTree
+                                        ? ImGuiTabItemFlags_SetSelected : 0)) {
+                app.SwitchToTree = false;
                 DrawTreeTab(app, *app.Result);
                 ImGui::EndTabItem();
             }
-            ImGuiTabItemFlags tmFlags = 0;
-            if (app.OpenTreemap || app.SwitchToTreemap) {
-                tmFlags = ImGuiTabItemFlags_SetSelected;
+            if (ImGui::BeginTabItem("Treemap", nullptr,
+                                    app.OpenTreemap || app.SwitchToTreemap
+                                        ? ImGuiTabItemFlags_SetSelected : 0)) {
                 app.OpenTreemap = app.SwitchToTreemap = false;
-            }
-            if (ImGui::BeginTabItem("Treemap", nullptr, tmFlags)) {
                 app.Treemap.Draw(*app.Result, [&](uint32_t node) {
                     NodeMenuItems(app, *app.Result, node, true);
                 });
@@ -852,6 +900,20 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
         }
 
         if (app.AutoScan) { app.AutoScan = false; StartScan(app); }
+        if (app.Rescanning && app.RescanDone) {
+            app.RescanThread.join();
+            app.Rescanning = false;
+            if (app.RescanError.empty()) {
+                app.Status = "Rescanned " + yadua::Utf8(app.RescanPath);
+                if (!app.Result->Exists(app.Treemap.Root())) app.Treemap.Reset();
+                app.Treemap.Invalidate();
+                app.UseSorted = false; // stale: node set changed
+                app.SortedChildren.clear();
+                RecomputeFilter(app);
+            } else {
+                app.Status = "Rescan failed: " + yadua::Utf8(app.RescanError);
+            }
+        }
         if (app.Scanning && app.ScanDone) {
             app.ScanThread.join();
             app.Scanning = false;
@@ -882,6 +944,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
 
     if (app.ScanThread.joinable()) app.ScanThread.join();
     if (app.DeleteThread.joinable()) app.DeleteThread.join();
+    if (app.RescanThread.joinable()) app.RescanThread.join();
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();

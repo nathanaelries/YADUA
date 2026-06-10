@@ -49,11 +49,11 @@ Launch `yadua-gui.exe` (it requests elevation itself), pick a drive, hit Scan.
   filter box that auto-expands to matches. Filters combine name terms,
   extensions, and sizes: `setup *.iso >100mb`.
 - **Treemap tab** — WinDirStat-style squarified treemap colored by file
-  extension. Hover for details, double-click to zoom into a folder,
-  Up/Top to zoom out.
+  extension, with toggleable cushion shading. Hover for details,
+  double-click to zoom into a folder, Up/Top to zoom out.
 - **Right-click** (both views) — Open in Explorer, Copy path, Properties,
   Delete to Recycle Bin (with confirmation; the view updates in place,
-  no rescan needed).
+  no rescan needed), and per-folder Rescan to refresh one subtree.
 
 ## Scan modes
 

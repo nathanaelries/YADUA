@@ -756,6 +756,118 @@ bool ExtendRunsFromAttributeList(HANDLE volume, const uint8_t* rec0,
     return true;
 }
 
+// ============================================================================
+// Filesystem walk (shared by the fallback scan and per-folder rescans)
+//
+// Multi-threaded FindFirstFileExW enumeration rooted at `rootPath` (with the
+// \\?\ long-path prefix), appending nodes under `rootNode`. Inaccessible
+// directories are skipped; reparse-point directories are never descended into
+// (junction cycles). Allocated sizes are approximated by cluster rounding.
+// ============================================================================
+
+void WalkTree(const std::wstring& rootPath, uint32_t rootNode, unsigned threads,
+              ScanResult& out, ScanProgress* progress) {
+    // Directory walks are latency-bound, so more threads than cores helps.
+    if (threads == 0) {
+        unsigned hw = std::thread::hardware_concurrency();
+        threads = hw ? std::min(hw * 2, 16u) : 4u;
+    }
+    const uint64_t clusterSize =
+        out.Stats.ClusterSize ? out.Stats.ClusterSize : 4096;
+
+    // Work queue of (directory path, its node index). `pending` counts
+    // queued + in-flight directories; 0 means finished.
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<std::pair<std::wstring, uint32_t>> work;
+    size_t pending = 1;
+    work.emplace_back(rootPath, rootNode);
+
+    struct Entry {
+        std::wstring Name;
+        uint64_t Size;
+        bool IsDir;
+        bool IsReparse;
+    };
+
+    auto worker = [&] {
+        std::vector<Entry> entries;
+        for (;;) {
+            std::unique_lock<std::mutex> lock(mutex);
+            cv.wait(lock, [&] { return !work.empty() || pending == 0; });
+            if (work.empty()) return; // pending == 0: all done
+            auto [dirPath, dirNode] = std::move(work.front());
+            work.pop_front();
+            lock.unlock();
+
+            // Enumerate outside the lock — this is where the time goes.
+            entries.clear();
+            WIN32_FIND_DATAW fd;
+            HANDLE find = FindFirstFileExW((dirPath + L"\\*").c_str(),
+                                           FindExInfoBasic, &fd,
+                                           FindExSearchNameMatch, nullptr,
+                                           FIND_FIRST_EX_LARGE_FETCH);
+            if (find != INVALID_HANDLE_VALUE) {
+                do {
+                    if (fd.cFileName[0] == L'.' &&
+                        (fd.cFileName[1] == L'\0' ||
+                         (fd.cFileName[1] == L'.' && fd.cFileName[2] == L'\0')))
+                        continue;
+                    entries.push_back(
+                        {fd.cFileName,
+                         ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow,
+                         (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0,
+                         (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0});
+                } while (FindNextFileW(find, &fd));
+                FindClose(find);
+            }
+            // else: access denied etc. — skip silently, like every walker must
+
+            lock.lock();
+            for (const Entry& e : entries) {
+                uint32_t idx = (uint32_t)out.Nodes.size();
+                Node n;
+                n.Flags      = kNodeInUse | kNodeNamed;
+                n.Sequence   = 1;
+                n.Parent     = dirNode;
+                n.ParentSeq  = out.Nodes[dirNode].Sequence;
+                n.NameOffset = (uint32_t)out.NameArena.size();
+                n.NameLength = (uint16_t)e.Name.size();
+                if (e.IsReparse) n.Flags |= kNodeReparse;
+                if (e.IsDir) {
+                    n.Flags |= kNodeIsDir;
+                } else {
+                    n.LogicalSize   = e.Size;
+                    n.AllocatedSize = (e.Size + clusterSize - 1)
+                                      / clusterSize * clusterSize;
+                }
+                out.NameArena.insert(out.NameArena.end(),
+                                     e.Name.begin(), e.Name.end());
+                out.Nodes.push_back(n);
+                // Never descend into reparse points: junction cycles would
+                // loop forever and their targets are counted where they live.
+                if (e.IsDir && !e.IsReparse) {
+                    work.emplace_back(dirPath + L"\\" + e.Name, idx);
+                    ++pending;
+                }
+            }
+            --pending; // this directory is done
+            if (progress)
+                progress->BytesRead.fetch_add(entries.size(),
+                                              std::memory_order_relaxed);
+            bool finished = pending == 0 && work.empty();
+            lock.unlock();
+            if (finished) cv.notify_all();
+            else cv.notify_one();
+        }
+    };
+
+    std::vector<std::thread> pool;
+    pool.reserve(threads);
+    for (unsigned t = 0; t < threads; ++t) pool.emplace_back(worker);
+    for (std::thread& t : pool) t.join();
+}
+
 } // namespace
 
 // ============================================================================
@@ -962,97 +1074,8 @@ bool ScanVolumeFallback(const std::wstring& driveIn, unsigned threads,
         out.NameArena.push_back(L'.');
     }
 
-    // Work queue of (directory path with \\?\ prefix, its node index).
-    // `pending` counts queued + in-flight directories; 0 means finished.
-    std::mutex mutex;
-    std::condition_variable cv;
-    std::deque<std::pair<std::wstring, uint32_t>> work;
-    size_t pending = 1;
-    work.emplace_back(L"\\\\?\\" + out.Drive, (uint32_t)kRootRecord);
-
-    struct Entry {
-        std::wstring Name;
-        uint64_t Size;
-        bool IsDir;
-        bool IsReparse;
-    };
-
-    auto worker = [&] {
-        std::vector<Entry> entries;
-        for (;;) {
-            std::unique_lock<std::mutex> lock(mutex);
-            cv.wait(lock, [&] { return !work.empty() || pending == 0; });
-            if (work.empty()) return; // pending == 0: all done
-            auto [dirPath, dirNode] = std::move(work.front());
-            work.pop_front();
-            lock.unlock();
-
-            // Enumerate outside the lock — this is where the time goes.
-            entries.clear();
-            WIN32_FIND_DATAW fd;
-            HANDLE find = FindFirstFileExW((dirPath + L"\\*").c_str(),
-                                           FindExInfoBasic, &fd,
-                                           FindExSearchNameMatch, nullptr,
-                                           FIND_FIRST_EX_LARGE_FETCH);
-            if (find != INVALID_HANDLE_VALUE) {
-                do {
-                    if (fd.cFileName[0] == L'.' &&
-                        (fd.cFileName[1] == L'\0' ||
-                         (fd.cFileName[1] == L'.' && fd.cFileName[2] == L'\0')))
-                        continue;
-                    entries.push_back(
-                        {fd.cFileName,
-                         ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow,
-                         (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0,
-                         (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0});
-                } while (FindNextFileW(find, &fd));
-                FindClose(find);
-            }
-            // else: access denied etc. — skip silently, like every walker must
-
-            lock.lock();
-            for (const Entry& e : entries) {
-                uint32_t idx = (uint32_t)out.Nodes.size();
-                Node n;
-                n.Flags      = kNodeInUse | kNodeNamed;
-                n.Sequence   = 1;
-                n.Parent     = dirNode;
-                n.ParentSeq  = 1;
-                n.NameOffset = (uint32_t)out.NameArena.size();
-                n.NameLength = (uint16_t)e.Name.size();
-                if (e.IsReparse) n.Flags |= kNodeReparse;
-                if (e.IsDir) {
-                    n.Flags |= kNodeIsDir;
-                } else {
-                    n.LogicalSize   = e.Size;
-                    n.AllocatedSize = (e.Size + clusterSize - 1)
-                                      / clusterSize * clusterSize;
-                }
-                out.NameArena.insert(out.NameArena.end(),
-                                     e.Name.begin(), e.Name.end());
-                out.Nodes.push_back(n);
-                // Never descend into reparse points: junction cycles would
-                // loop forever and their targets are counted where they live.
-                if (e.IsDir && !e.IsReparse) {
-                    work.emplace_back(dirPath + L"\\" + e.Name, idx);
-                    ++pending;
-                }
-            }
-            --pending; // this directory is done
-            if (progress)
-                progress->BytesRead.fetch_add(entries.size(),
-                                              std::memory_order_relaxed);
-            bool finished = pending == 0 && work.empty();
-            lock.unlock();
-            if (finished) cv.notify_all();
-            else cv.notify_one();
-        }
-    };
-
-    std::vector<std::thread> pool;
-    pool.reserve(threads);
-    for (unsigned t = 0; t < threads; ++t) pool.emplace_back(worker);
-    for (std::thread& t : pool) t.join();
+    WalkTree(L"\\\\?\\" + out.Drive, (uint32_t)kRootRecord, threads, out,
+             progress);
 
     out.Stats.RecordsParsed = out.Nodes.size() - (kRootRecord + 1);
     auto t1 = std::chrono::steady_clock::now();
@@ -1090,6 +1113,69 @@ bool ScanVolumeAuto(const std::wstring& drive, unsigned threads,
     }
     error = mftError + L"; directory-walk fallback also failed: " + walkError;
     return false;
+}
+
+// ============================================================================
+// In-place updates: Reindex + RescanSubtree
+// ============================================================================
+
+void Reindex(ScanResult& r) {
+    r.FileCount = 0;
+    r.DirCount  = 0;
+    Aggregate(r);       // re-assigns Totals from scratch
+    BuildChildIndex(r);
+}
+
+bool RescanSubtree(ScanResult& r, uint32_t dir, std::wstring& error,
+                   ScanProgress* progress) {
+    if (dir >= r.Nodes.size() || !r.Exists(dir) || !r.IsDir(dir)) {
+        error = L"not a scannable directory";
+        return false;
+    }
+    if (r.Nodes[dir].Flags & kNodeReparse) {
+        error = L"cannot rescan a reparse point (its contents live elsewhere)";
+        return false;
+    }
+    std::wstring path = L"\\\\?\\" + r.Path(dir);
+    DWORD attrs = GetFileAttributesW(path.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES ||
+        !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        error = Format(L"cannot access %ls (error %lu)", r.Path(dir).c_str(),
+                       GetLastError());
+        return false;
+    }
+
+    // 1. Drop every current descendant (the dir node itself stays — it may be
+    //    a real MFT record other nodes reference).
+    std::vector<uint32_t> stack{dir};
+    while (!stack.empty()) {
+        uint32_t n = stack.back();
+        stack.pop_back();
+        for (uint32_t c = r.Children.Offset[n]; c < r.Children.Offset[n + 1]; ++c) {
+            uint32_t child = r.Children.List[c];
+            r.Nodes[child].Flags = 0;
+            stack.push_back(child);
+        }
+    }
+    // The walk can't see $I30 index sizes, so the dir's own allocated bytes
+    // from an earlier MFT scan are kept as-is (they're still roughly right).
+
+    // 2. Enumerate the subtree fresh; new nodes append past the old ones.
+    if (progress) {
+        progress->BytesRead  = 0;
+        progress->TotalBytes = 0;
+        progress->Stage      = ScanProgress::Reading;
+    }
+    if (!r.Stats.ClusterSize) r.Stats.ClusterSize = 4096;
+    WalkTree(path, dir, 0, r, progress);
+
+    // 3. Rebuild totals and the child index from the merged node set.
+    if (progress)
+        progress->Stage.store(ScanProgress::Aggregating, std::memory_order_relaxed);
+    Reindex(r);
+    if (progress)
+        progress->Stage.store(ScanProgress::Done, std::memory_order_relaxed);
+    return true;
 }
 
 } // namespace yadua

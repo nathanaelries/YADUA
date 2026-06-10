@@ -15,8 +15,17 @@
 #include "imgui.h"
 #include "scanner.h"
 
+// Color derived from a file's extension (FNV hash -> hue), so same-type
+// files match across the treemap and the tree view's name tinting.
+ImU32 ExtensionColor(const yadua::ScanResult& r, uint32_t node,
+                     float sat, float val);
+
 class TreemapView {
 public:
+    // WinDirStat-style cushion look: per-rect gradient from a lit top-left
+    // corner to a shaded bottom-right. Toggled from the treemap toolbar.
+    bool Cushion = true;
+
     // Marks the cached layout stale (new scan, deletion, ...).
     void Invalidate() { dirty_ = true; }
 

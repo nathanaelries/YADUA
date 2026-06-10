@@ -18,15 +18,20 @@ constexpr float    kMinSide   = 3.0f;   // lump items smaller than this
 constexpr int      kMaxDepth  = 24;
 constexpr size_t   kMaxItems  = 200000; // hard cap, keeps frame cost bounded
 
-// Color files by extension so same-type files cluster visually, like
-// WinDirStat. Hash -> hue, with a little brightness variation.
-ImU32 FileColor(const ScanResult& r, uint32_t node) {
+// FNV-1a over the lowercased extension.
+uint32_t ExtensionHash(const ScanResult& r, uint32_t node) {
     std::wstring name = r.Name(node);
     size_t dot = name.find_last_of(L'.');
-    uint32_t h = 2166136261u; // FNV-1a over the lowercased extension
+    uint32_t h = 2166136261u;
     if (dot != std::wstring::npos && name.size() - dot <= 9)
         for (size_t i = dot + 1; i < name.size(); ++i)
             h = (h ^ (uint32_t)towlower(name[i])) * 16777619u;
+    return h;
+}
+
+// Treemap fill: extension hue with a little brightness variation.
+ImU32 FileColor(const ScanResult& r, uint32_t node) {
+    uint32_t h = ExtensionHash(r, node);
     float hue = (float)(h % 360u) / 360.0f;
     float val = 0.62f + (float)((h >> 9) % 25u) / 100.0f;
     ImVec4 c = ImColor::HSV(hue, 0.55f, val);
@@ -46,6 +51,11 @@ double WorstRatio(double rowSum, double rowMin, double rowMax, double side) {
 }
 
 } // namespace
+
+ImU32 ExtensionColor(const ScanResult& r, uint32_t node, float sat, float val) {
+    float hue = (float)(ExtensionHash(r, node) % 360u) / 360.0f;
+    return ImColor(ImColor::HSV(hue, sat, val));
+}
 
 // Lay out the children of `dir` (canonical child order is size-descending,
 // exactly what squarify wants) into the rectangle (x0,y0)-(x1,y1).
@@ -170,6 +180,8 @@ void TreemapView::Draw(const ScanResult& r,
     if (ImGui::Button("Top")) Reset();
     ImGui::EndDisabled();
     ImGui::SameLine();
+    ImGui::Checkbox("Cushion", &Cushion);
+    ImGui::SameLine();
     ImGui::TextUnformatted(yadua::Utf8(r.Path(root_)).c_str());
     ImGui::SameLine();
     ImGui::TextDisabled("(hover: details, double-click: zoom, right-click: actions)");
@@ -207,7 +219,20 @@ void TreemapView::Draw(const ScanResult& r,
             dl->AddRectFilled(it.Min, it.Max, kDirFill);
             dl->AddRect(it.Min, it.Max, kDirBorder);
         } else {
-            dl->AddRectFilled(it.Min, it.Max, FileColor(r, it.Node));
+            ImU32 fill = FileColor(r, it.Node);
+            if (Cushion && it.Max.x - it.Min.x > 3 && it.Max.y - it.Min.y > 3) {
+                // Pillow-style gradient: lit top-left, shaded bottom-right.
+                ImVec4 f = ImGui::ColorConvertU32ToFloat4(fill);
+                auto shade = [&](float m) {
+                    return ImGui::ColorConvertFloat4ToU32(
+                        ImVec4(std::min(f.x * m, 1.0f), std::min(f.y * m, 1.0f),
+                               std::min(f.z * m, 1.0f), 1.0f));
+                };
+                dl->AddRectFilledMultiColor(it.Min, it.Max, shade(1.35f), fill,
+                                            shade(0.55f), fill);
+            } else {
+                dl->AddRectFilled(it.Min, it.Max, fill);
+            }
             if (it.Max.x - it.Min.x > 4 && it.Max.y - it.Min.y > 4)
                 dl->AddRect(it.Min, it.Max, kFileBorder);
         }
