@@ -20,7 +20,6 @@ Every version tag publishes to the
   shortcut, optional desktop icon, optional CLI on PATH, and an uninstaller.
 - **Portable** (`YADUA-*-portable.zip`) — both executables, run from
   anywhere, no installation and no traces outside the folder.
-- Bare `.exe` files for scripting/automation.
 
 > **Antivirus note:** the binaries are currently unsigned, and an unsigned,
 > freshly-released tool that requests elevation and reads raw NTFS volumes is

@@ -13,8 +13,6 @@
 #                                                   shortcuts, optional PATH)
 #   YADUA-v1.2.3-windows-{amd64,arm64}-portable.zip portable: both exes,
 #                                                   no install needed
-#   YADUA-v1.2.3-windows-{amd64,arm64}.exe          bare GUI executable
-#   YADUA-cli-v1.2.3-windows-{amd64,arm64}.exe      bare CLI executable
 #   SHA256SUMS.txt                                  checksums for all assets
 # ============================================================================
 name: Release
@@ -67,7 +65,7 @@ jobs:
           ./yadua.exe --help
           if ($LASTEXITCODE -ne 0) { throw "CLI smoke test failed" }
 
-      # Bare exes (clean names), a portable zip, and the Inno Setup installer.
+      # A portable zip and the Inno Setup installer (both contain GUI + CLI).
       # Inno Setup 6 is preinstalled on the hosted Windows runner image.
       - name: Stage release assets
         shell: pwsh
@@ -76,8 +74,6 @@ jobs:
           $ver  = $tag.TrimStart('v')
           $arch = '${{ matrix.arch }}'
           New-Item -ItemType Directory dist | Out-Null
-          Copy-Item yadua-gui.exe "dist/YADUA-$tag-windows-$arch.exe"
-          Copy-Item yadua.exe     "dist/YADUA-cli-$tag-windows-$arch.exe"
           Compress-Archive -Path yadua-gui.exe, yadua.exe, LICENSE, README.md `
               -DestinationPath "dist/YADUA-$tag-windows-$arch-portable.zip"
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Qp `
