@@ -33,13 +33,17 @@
 
 ## Phase 2 — Interactive UI
 
-- [ ] Tree view sorted by size, expand/collapse (Dear ImGui)
+- [x] Tree view sorted by size, expand/collapse (Dear ImGui, Win32 + DX11)
+- [x] Percent-of-parent bars
+- [x] Filter by name (case-insensitive, auto-expands to matches)
+- [x] Right-click: Open in Explorer, Copy path
+- [x] Rescan button, background scan with progress bar
 - [ ] Treemap visualization (WinDirStat-style squarified treemap)
-- [ ] Search / filter by name, size, extension
-- [ ] Right-click actions: Open in Explorer, Delete (to Recycle Bin),
-      Copy path, Properties
-- [ ] Rescan button + per-folder rescan
-- [ ] Percent-of-parent bars, file-type coloring
+- [ ] Filter by size / extension
+- [ ] Right-click: Delete (to Recycle Bin), Properties
+- [ ] Per-folder rescan
+- [ ] File-type coloring, icons
+- [ ] Sortable columns (currently always by size)
 
 ## Phase 3 — Polish
 

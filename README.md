@@ -11,10 +11,22 @@ thread streams the MFT while a pool of worker threads parses the records.
 ## Build
 
 ```powershell
-.\build.ps1     # finds MSVC via vswhere, builds yadua.exe (C++20, /O2 /W4)
+.\build.ps1     # finds MSVC via vswhere, builds both targets (C++20, /O2)
 ```
 
-## Run (requires Administrator — raw volume access)
+Produces:
+
+- `yadua.exe` — console scanner with CSV/JSON export
+- `yadua-gui.exe` — interactive tree view (Dear ImGui, Win32 + DirectX 11;
+  vendored under `third_party/imgui`)
+
+## GUI
+
+Launch `yadua-gui.exe` (it requests elevation itself), pick a drive, hit Scan.
+Tree is sorted by size with percent-of-parent bars; type in the filter box to
+narrow by name; right-click any row to open it in Explorer or copy its path.
+
+## CLI (run from an elevated prompt)
 
 ```powershell
 yadua.exe C: --top 50 --csv results.csv --json results.json
@@ -25,6 +37,14 @@ yadua.exe C: --all --json full.json    # adds a nested "tree" object
 Options: `--top N` (list length, default 50), `--csv FILE`, `--json FILE`,
 `--all` (export the entire tree instead of just the top-N lists),
 `--threads N` (parser threads, default auto).
+
+## Code layout
+
+- `src/ntfs.h` — NTFS on-disk structures (FILE records, attributes)
+- `src/scanner.h/.cpp` — the scan engine (raw MFT streaming, parallel parse,
+  aggregation, child index); used by both frontends
+- `src/cli.cpp` — console frontend + exports
+- `src/gui.cpp` — Dear ImGui frontend
 
 ## How it works
 

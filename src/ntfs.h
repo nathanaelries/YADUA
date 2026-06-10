@@ -1,0 +1,95 @@
+// ============================================================================
+// NTFS on-disk structures
+//
+// These are not in the Windows SDK (the MFT layout is technically
+// undocumented but stable since NT 3.1 and described in great detail in the
+// Linux-NTFS / ntfs-3g project docs). All fields are little-endian.
+// ============================================================================
+#pragma once
+#include <cstdint>
+
+namespace yadua::ntfs {
+
+#pragma pack(push, 1)
+
+// Every MFT record ("FILE record segment") starts with this header.
+struct FileRecordHeader {
+    uint32_t Magic;             // 'FILE' (0x454C4946), or 'BAAD' if corrupt
+    uint16_t UsaOffset;         // offset of the Update Sequence Array
+    uint16_t UsaCount;          // 1 (USN) + one entry per sector of the record
+    uint64_t Lsn;               // $LogFile sequence number
+    uint16_t SequenceNumber;    // bumped every time the record is reused
+    uint16_t HardLinkCount;
+    uint16_t FirstAttributeOffset;
+    uint16_t Flags;             // 0x01 = in use, 0x02 = directory
+    uint32_t UsedSize;          // bytes actually used within the record
+    uint32_t AllocatedSize;     // total record size (== BytesPerFileRecordSegment)
+    uint64_t BaseRecord;        // 0 for base records; file-reference of the base
+                                // record for "extension" records (overflow)
+    uint16_t NextAttributeId;
+};
+
+constexpr uint32_t kFileRecordMagic   = 0x454C4946; // 'FILE'
+constexpr uint16_t kRecordInUse       = 0x0001;
+constexpr uint16_t kRecordIsDirectory = 0x0002;
+
+// Attribute type codes we care about.
+constexpr uint32_t kAttrFileName = 0x30;
+constexpr uint32_t kAttrData     = 0x80;
+constexpr uint32_t kAttrEnd      = 0xFFFFFFFF;
+
+// Common header at the start of every attribute inside a record.
+struct AttributeHeader {
+    uint32_t Type;
+    uint32_t Length;            // total attribute length, 8-byte aligned
+    uint8_t  NonResident;       // 0 = value stored inline, 1 = value on disk
+    uint8_t  NameLength;        // attribute name length in WCHARs (e.g. ADS name)
+    uint16_t NameOffset;
+    uint16_t Flags;             // compressed / encrypted / sparse
+    uint16_t AttributeId;
+};
+
+// Resident attribute: the value lives inside the MFT record itself.
+struct ResidentAttribute {
+    AttributeHeader Header;
+    uint32_t ValueLength;
+    uint16_t ValueOffset;
+    uint8_t  IndexedFlag;
+    uint8_t  Padding;
+};
+
+// Non-resident attribute: value lives in clusters on disk, located by a
+// "run list" (a compact RLE encoding of (cluster, length) extents).
+struct NonResidentAttribute {
+    AttributeHeader Header;
+    uint64_t LowestVcn;         // first Virtual Cluster Number covered by this
+                                // record (>0 means continuation in an extension)
+    uint64_t HighestVcn;
+    uint16_t RunListOffset;
+    uint16_t CompressionUnit;
+    uint32_t Padding;
+    uint64_t AllocatedSize;     // clusters reserved on disk, in bytes
+    uint64_t RealSize;          // logical EOF
+    uint64_t InitializedSize;
+};
+
+// Value of a $FILE_NAME attribute (always resident).
+struct FileNameAttribute {
+    uint64_t ParentRef;         // file reference of parent dir:
+                                // low 48 bits = MFT record #, high 16 = sequence
+    uint64_t CreationTime;
+    uint64_t ModificationTime;
+    uint64_t MftChangeTime;
+    uint64_t AccessTime;
+    uint64_t AllocatedSize;     // stale duplicates of $DATA sizes — do not trust,
+    uint64_t RealSize;          //   NTFS only updates them lazily
+    uint32_t FileAttributes;
+    uint32_t ReparseValue;
+    uint8_t  NameLength;        // in WCHARs
+    uint8_t  NameSpace;         // 0=POSIX 1=Win32 2=DOS(8.3) 3=Win32&DOS
+    // WCHAR Name[NameLength] follows
+};
+
+#pragma pack(pop)
+
+} // namespace yadua::ntfs

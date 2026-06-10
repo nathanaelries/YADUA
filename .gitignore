@@ -2,6 +2,11 @@
 *.exe
 *.obj
 *.pdb
+obj/
+imgui.ini
+
+# Local screenshots
+*.png
 
 # Scan results (contain local disk contents)
 scan*.csv
