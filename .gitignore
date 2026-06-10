@@ -1,0 +1,9 @@
+# Build outputs
+*.exe
+*.obj
+*.pdb
+
+# Scan results (contain local disk contents)
+scan*.csv
+scan_output.txt
+results.csv
