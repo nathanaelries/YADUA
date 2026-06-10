@@ -1,0 +1,49 @@
+# YADUA Roadmap
+
+## Phase 1 — Core scanner (console)
+
+- [x] Raw volume access + `FSCTL_GET_NTFS_VOLUME_DATA`
+- [x] $MFT run-list decoding and sequential streaming reads
+- [x] FILE record parsing (fixups, $FILE_NAME, unnamed $DATA, extension records)
+- [x] In-memory tree from parent references, bottom-up folder aggregation
+- [x] Top-N folders/files report with timing stats
+- [x] CSV export (top-N lists)
+- [ ] JSON export
+- [ ] Full-tree export (every file/folder, not just top-N)
+- [ ] Multi-threaded record parsing (split MFT buffer across cores; overlap
+      parse with I/O — should roughly halve the ~5 s scan)
+- [ ] Scan multiple/all fixed volumes in one run
+- [ ] Progress reporting during the read (percent of MFT streamed)
+
+### Parser correctness gaps
+
+- [ ] Parse `$ATTRIBUTE_LIST` so a heavily fragmented $MFT (run list overflowing
+      into extension records) scans instead of bailing with an error
+- [ ] Surface orphaned subtrees in a visible "lost+found" bucket instead of
+      silently dropping their contribution
+- [ ] Mark reparse points (junctions, symlinks, OneDrive placeholders) and
+      exclude/flag them in totals
+- [ ] Optional: count alternate data streams (named $DATA), excluding
+      $BadClus:$Bad
+- [ ] Optional: include directory index ($INDEX_ALLOCATION) sizes so
+      "size on disk" matches Explorer more closely
+- [ ] Fallback scan path (recursive `FindFirstFileExW`) for non-NTFS volumes
+      (FAT32/exFAT/ReFS) and non-admin runs
+
+## Phase 2 — Interactive UI
+
+- [ ] Tree view sorted by size, expand/collapse (Dear ImGui)
+- [ ] Treemap visualization (WinDirStat-style squarified treemap)
+- [ ] Search / filter by name, size, extension
+- [ ] Right-click actions: Open in Explorer, Delete (to Recycle Bin),
+      Copy path, Properties
+- [ ] Rescan button + per-folder rescan
+- [ ] Percent-of-parent bars, file-type coloring
+
+## Phase 3 — Polish
+
+- [ ] Auto-elevation (relaunch with UAC prompt when not admin)
+- [ ] Live updates via USN journal (track changes without rescanning)
+- [ ] Export/import scan snapshots; diff two scans over time
+- [ ] x64 + ARM64 release builds, CI via GitHub Actions
+- [ ] Benchmark suite vs. WizTree / WinDirStat / TreeSize

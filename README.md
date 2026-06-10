@@ -38,7 +38,6 @@ namespace handling, etc.).
 
 ## Roadmap
 
-- [x] Phase 1: console scanner, top-N folders/files, CSV export
-- [ ] JSON export, full-tree export
-- [ ] Phase 2: interactive tree view UI, treemap, search/filter,
-      Explorer integration
+See [TODO.md](TODO.md). Short version: finish the console scanner
+(JSON/full-tree export, multi-threaded parsing, parser edge cases), then an
+interactive tree view + treemap UI (Phase 2).
