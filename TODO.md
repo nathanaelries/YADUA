@@ -67,7 +67,10 @@
 - [x] Auto-elevation (GUI manifest requests Administrator; non-elevated
       scans still work via the directory-walk fallback)
 - [ ] Live updates via USN journal (track changes without rescanning)
-- [ ] Export/import scan snapshots; diff two scans over time
+- [x] Export/import scan snapshots; diff two scans over time
+      (`--snapshot out.ysnap`, `--diff old.ysnap new.ysnap` or
+      `--diff old.ysnap C:` to compare against a live scan; compact
+      binary format, ~116 MB for 1.5M entries)
 - [x] x64 + ARM64 release builds, CI via GitHub Actions (tag-triggered
       release workflow with checksums + generated notes)
 - [x] Installer (Inno Setup: GUI + CLI, shortcuts, optional PATH) and
@@ -75,4 +78,7 @@
 - [x] VERSIONINFO resource stamped from the release tag
 - [ ] Code signing (Azure Trusted Signing or similar) to stop antivirus /
       SmartScreen false positives on the unsigned binaries
-- [ ] Benchmark suite vs. WizTree / WinDirStat / TreeSize
+- [x] Benchmark suite (`tools/benchmark.ps1`): times the raw-MFT scan, the
+      directory-walk baseline (WinDirStat-style technique), and WizTree's
+      CSV export when installed. Measured here: MFT 3.8 s vs walk 35 s
+      for 1.2M files

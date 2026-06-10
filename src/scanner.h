@@ -66,6 +66,7 @@ struct ScanStats {
     uint64_t MftBytes      = 0;
     double   StreamSeconds = 0; // MFT read+parse (or directory walk)
     double   TotalSeconds  = 0; // including aggregation and indexing
+    uint64_t ScanUnixTime  = 0; // when the scan ran (for snapshot diffs)
     unsigned Threads       = 0;
     bool     UsedFallback  = false; // directory walk instead of raw MFT
 };
@@ -137,6 +138,15 @@ void Reindex(ScanResult& r);
 // reparse-point directories.
 bool RescanSubtree(ScanResult& r, uint32_t dir, std::wstring& error,
                    ScanProgress* progress = nullptr);
+
+// Snapshots: a compact binary dump of the tree (names, parents, sizes,
+// dir/reparse flags) for later diffing. LoadSnapshot rebuilds a full
+// ScanResult (totals and child index included), so a loaded snapshot can be
+// browsed or diffed like a live scan.
+bool SaveSnapshot(const ScanResult& r, const std::wstring& file,
+                  std::wstring& error);
+bool LoadSnapshot(const std::wstring& file, ScanResult& out,
+                  std::wstring& error);
 
 // Formatting helpers shared by the frontends.
 std::string  Utf8(const std::wstring& w);

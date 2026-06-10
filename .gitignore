@@ -15,3 +15,6 @@ scan*.json
 scan_output.txt
 results.csv
 results.json
+
+# Snapshots
+*.ysnap

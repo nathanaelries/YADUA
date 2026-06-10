@@ -881,6 +881,7 @@ bool ScanVolume(const std::wstring& driveIn, unsigned threads, ScanResult& out,
     out.Drive = driveIn;
     if (out.Drive.size() == 1) out.Drive += L':';
     if (out.Drive.size() > 2 && out.Drive.back() == L'\\') out.Drive.pop_back();
+    out.Stats.ScanUnixTime = (uint64_t)_time64(nullptr);
 
     if (threads == 0) {
         unsigned hw = std::thread::hardware_concurrency();
@@ -1034,6 +1035,7 @@ bool ScanVolumeFallback(const std::wstring& driveIn, unsigned threads,
     if (out.Drive.size() == 1) out.Drive += L':';
     if (out.Drive.size() > 2 && out.Drive.back() == L'\\') out.Drive.pop_back();
     out.Stats.UsedFallback = true;
+    out.Stats.ScanUnixTime = (uint64_t)_time64(nullptr);
 
     std::wstring rootDir = out.Drive + L"\\";
     if (GetFileAttributesW(rootDir.c_str()) == INVALID_FILE_ATTRIBUTES) {
@@ -1175,6 +1177,152 @@ bool RescanSubtree(ScanResult& r, uint32_t dir, std::wstring& error,
     Reindex(r);
     if (progress)
         progress->Stage.store(ScanProgress::Done, std::memory_order_relaxed);
+    return true;
+}
+
+// ============================================================================
+// Snapshots
+//
+// Format ("YADUASNP", version 1, little-endian):
+//   char[8] magic, u32 version, u64 scanUnixTime,
+//   u32 driveChars, wchar drive[],
+//   u64 nodeCount, then per node (parents always precede children):
+//     u32 parentDense, u8 flags (dir|reparse), u16 nameChars,
+//     u64 logicalSize, u64 allocatedSize, wchar name[]
+// Dense index 0 is the root; the loader places it back at kRootRecord and
+// recomputes totals/child index with Reindex, so a loaded snapshot behaves
+// exactly like a live scan result.
+// ============================================================================
+
+namespace {
+
+constexpr char     kSnapMagic[8]  = {'Y','A','D','U','A','S','N','P'};
+constexpr uint32_t kSnapVersion   = 1;
+
+#pragma pack(push, 1)
+struct SnapNode {
+    uint32_t Parent;     // dense index of the parent
+    uint8_t  Flags;      // kNodeIsDir | kNodeReparse
+    uint16_t NameChars;
+    uint64_t Logical;
+    uint64_t Allocated;
+};
+#pragma pack(pop)
+
+} // namespace
+
+bool SaveSnapshot(const ScanResult& r, const std::wstring& file,
+                  std::wstring& error) {
+    FILE* f = _wfopen(file.c_str(), L"wb");
+    if (!f) {
+        error = Format(L"cannot write %ls", file.c_str());
+        return false;
+    }
+    setvbuf(f, nullptr, _IOFBF, 1 << 20);
+
+    // BFS over the child index so every node's parent precedes it.
+    std::vector<uint32_t> order;
+    std::vector<uint32_t> dense(r.Nodes.size(), UINT32_MAX);
+    order.reserve((size_t)(r.FileCount + r.DirCount + 1));
+    order.push_back((uint32_t)kRootRecord);
+    dense[kRootRecord] = 0;
+    for (size_t i = 0; i < order.size(); ++i) {
+        uint32_t n = order[i];
+        for (uint32_t c = r.Children.Offset[n]; c < r.Children.Offset[n + 1]; ++c) {
+            uint32_t child = r.Children.List[c];
+            if (!r.Exists(child)) continue;
+            dense[child] = (uint32_t)order.size();
+            order.push_back(child);
+        }
+    }
+
+    fwrite(kSnapMagic, 1, 8, f);
+    fwrite(&kSnapVersion, 4, 1, f);
+    fwrite(&r.Stats.ScanUnixTime, 8, 1, f);
+    uint32_t driveChars = (uint32_t)r.Drive.size();
+    fwrite(&driveChars, 4, 1, f);
+    fwrite(r.Drive.data(), sizeof(wchar_t), driveChars, f);
+    uint64_t count = order.size();
+    fwrite(&count, 8, 1, f);
+
+    for (uint32_t n : order) {
+        const Node& node = r.Nodes[n];
+        SnapNode s{n == (uint32_t)kRootRecord ? 0u : dense[node.Parent],
+                   (uint8_t)(node.Flags & (kNodeIsDir | kNodeReparse)),
+                   node.NameLength, node.LogicalSize, node.AllocatedSize};
+        fwrite(&s, sizeof(s), 1, f);
+        fwrite(r.NameArena.data() + node.NameOffset, sizeof(wchar_t),
+               node.NameLength, f);
+    }
+
+    bool ok = !ferror(f);
+    fclose(f);
+    if (!ok) error = Format(L"write error on %ls", file.c_str());
+    return ok;
+}
+
+bool LoadSnapshot(const std::wstring& file, ScanResult& out,
+                  std::wstring& error) {
+    out = ScanResult{};
+    FILE* f = _wfopen(file.c_str(), L"rb");
+    if (!f) {
+        error = Format(L"cannot open %ls", file.c_str());
+        return false;
+    }
+    setvbuf(f, nullptr, _IOFBF, 1 << 20);
+    auto fail = [&](const wchar_t* what) {
+        fclose(f);
+        error = Format(L"%ls is not a valid snapshot (%ls)", file.c_str(), what);
+        return false;
+    };
+
+    char magic[8];
+    uint32_t version = 0;
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, kSnapMagic, 8) != 0)
+        return fail(L"bad magic");
+    if (fread(&version, 4, 1, f) != 1 || version != kSnapVersion)
+        return fail(L"unsupported version");
+    if (fread(&out.Stats.ScanUnixTime, 8, 1, f) != 1) return fail(L"truncated");
+    uint32_t driveChars = 0;
+    if (fread(&driveChars, 4, 1, f) != 1 || driveChars > 64)
+        return fail(L"bad drive");
+    out.Drive.resize(driveChars);
+    if (fread(out.Drive.data(), sizeof(wchar_t), driveChars, f) != driveChars)
+        return fail(L"truncated");
+    uint64_t count = 0;
+    if (fread(&count, 8, 1, f) != 1 || count == 0 || count > 0xFFFFFFFFull)
+        return fail(L"bad node count");
+
+    // Dense index d maps to node index kRootRecord (d == 0) or kRootRecord + d.
+    auto toIndex = [](uint32_t d) {
+        return d == 0 ? (uint32_t)kRootRecord : (uint32_t)kRootRecord + d;
+    };
+    out.Nodes.assign((size_t)kRootRecord + count, Node{});
+    for (uint64_t d = 0; d < count; ++d) {
+        SnapNode s;
+        if (fread(&s, sizeof(s), 1, f) != 1) return fail(L"truncated node");
+        if (s.NameChars > 4096) return fail(L"bad name length");
+        if (d > 0 && (s.Parent >= d)) return fail(L"bad parent order");
+
+        Node& n = out.Nodes[toIndex((uint32_t)d)];
+        n.Flags      = (uint8_t)(s.Flags | kNodeInUse | kNodeNamed);
+        n.Sequence   = 1;
+        n.Parent     = d == 0 ? (uint32_t)kRootRecord : toIndex(s.Parent);
+        n.ParentSeq  = 1;
+        n.LogicalSize   = s.Logical;
+        n.AllocatedSize = s.Allocated;
+        n.NameOffset = (uint32_t)out.NameArena.size();
+        n.NameLength = s.NameChars;
+        size_t old = out.NameArena.size();
+        out.NameArena.resize(old + s.NameChars);
+        if (s.NameChars &&
+            fread(out.NameArena.data() + old, sizeof(wchar_t), s.NameChars, f)
+                != s.NameChars)
+            return fail(L"truncated name");
+    }
+    fclose(f);
+    out.Nodes[kRootRecord].Flags |= kNodeIsDir; // the root is always a dir
+    Reindex(out);
     return true;
 }
 

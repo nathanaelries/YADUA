@@ -73,7 +73,30 @@ yadua.exe C: --all --json full.json    # adds a nested "tree" object
 
 Options: `--top N` (list length, default 50), `--csv FILE`, `--json FILE`,
 `--all` (export the entire tree instead of just the top-N lists),
-`--threads N` (parser threads, default auto).
+`--walk` (force the directory-walk scanner), `--threads N` (default auto).
+
+## Snapshots & diff
+
+Track where disk space went between two points in time:
+
+```powershell
+yadua.exe C: --snapshot before.ysnap     # save a snapshot during a scan
+# ... days pass ...
+yadua.exe --diff before.ysnap C:         # compare against a live scan
+yadua.exe --diff before.ysnap after.ysnap --top 30
+```
+
+The diff reports total growth, added/removed file counts, and the largest
+changes (grown/shrunk folders and files, additions, deletions). Snapshots are
+a compact binary format (~116 MB for 1.5M entries).
+
+## Benchmarks
+
+`tools/benchmark.ps1` times the scan strategies on your machine. On the dev
+machine (1.2M files, NVMe): raw-MFT scan **3.8 s**, directory-walk baseline
+(the WinDirStat-style technique) **35 s**. WizTree is also timed when
+installed; note its scriptable mode includes a full CSV export, so that
+number is not a pure scan time.
 
 ## Code layout
 

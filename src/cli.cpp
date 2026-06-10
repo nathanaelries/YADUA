@@ -12,9 +12,12 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <ctime>
+#include <cwctype>
 #include <functional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "scanner.h"
@@ -162,7 +165,8 @@ static void ExportJson(FILE* f, const ScanResult& r, const TopLists& top,
 // ============================================================================
 
 static bool ScanWithProgress(const std::wstring& drive, unsigned threads,
-                             ScanResult& r, std::wstring& error) {
+                             ScanResult& r, std::wstring& error,
+                             bool forceWalk = false) {
     ScanProgress progress;
     std::atomic<bool> finished{false};
     std::thread ticker;
@@ -185,7 +189,9 @@ static bool ScanWithProgress(const std::wstring& drive, unsigned threads,
             fprintf(stderr, "\r%*s\r", 60, ""); // wipe the progress line
         });
     }
-    bool ok = ScanVolumeAuto(drive, threads, r, error, &progress);
+    bool ok = forceWalk
+                  ? ScanVolumeFallback(drive, threads, r, error, &progress)
+                  : ScanVolumeAuto(drive, threads, r, error, &progress);
     finished = true;
     if (ticker.joinable()) ticker.join();
     return ok;
@@ -202,6 +208,182 @@ static std::wstring SuffixedPath(const std::wstring& path, const ScanResult& r,
     if (dot == std::wstring::npos || dot < path.find_last_of(L"\\/") + 1)
         return path + suffix;
     return path.substr(0, dot) + suffix + path.substr(dot);
+}
+
+// ============================================================================
+// Snapshot diff: recursive tree comparison matching children by name.
+// ============================================================================
+
+struct DiffChange {
+    std::wstring Path;
+    int64_t      Delta = 0;       // signed byte change (cumulative for dirs)
+    uint64_t     OldSize = 0, NewSize = 0;
+    bool         IsDir = false;
+    enum Kind { Changed, Added, Removed } What = Changed;
+};
+
+struct DiffTally {
+    uint64_t FilesAdded = 0, FilesRemoved = 0, DirsAdded = 0, DirsRemoved = 0;
+};
+
+static std::wstring LowerName(const ScanResult& r, uint32_t n) {
+    std::wstring s = r.Name(n);
+    for (wchar_t& c : s) c = towlower(c);
+    return s;
+}
+
+static void RecordWholeSubtree(const ScanResult& r, uint32_t n,
+                               const std::wstring& path, bool added,
+                               std::vector<DiffChange>& changes, DiffTally& t) {
+    DiffChange c;
+    c.Path  = path;
+    c.IsDir = r.IsDir(n);
+    c.What  = added ? DiffChange::Added : DiffChange::Removed;
+    uint64_t size = r.SizeOf(n);
+    c.Delta = added ? (int64_t)size : -(int64_t)size;
+    (added ? c.NewSize : c.OldSize) = size;
+    if (c.IsDir) {
+        uint64_t files = r.Totals[n].FileCount, dirs = r.Totals[n].DirCount + 1;
+        if (added) { t.FilesAdded += files; t.DirsAdded += dirs; }
+        else       { t.FilesRemoved += files; t.DirsRemoved += dirs; }
+    } else {
+        if (added) ++t.FilesAdded; else ++t.FilesRemoved;
+    }
+    if (c.Delta != 0 || !c.IsDir) changes.push_back(std::move(c));
+}
+
+static void DiffDirs(const ScanResult& a, uint32_t da,
+                     const ScanResult& b, uint32_t db, std::wstring& path,
+                     std::vector<DiffChange>& changes, DiffTally& tally,
+                     int depth) {
+    if (depth > 512) return;
+    std::unordered_map<std::wstring, uint32_t> bKids;
+    for (uint32_t c = b.Children.Offset[db]; c < b.Children.Offset[db + 1]; ++c) {
+        uint32_t child = b.Children.List[c];
+        if (b.Exists(child)) bKids.emplace(LowerName(b, child), child);
+    }
+
+    for (uint32_t c = a.Children.Offset[da]; c < a.Children.Offset[da + 1]; ++c) {
+        uint32_t ca = a.Children.List[c];
+        if (!a.Exists(ca)) continue;
+        size_t len = path.size();
+        path += L'\\';
+        path += a.Name(ca);
+
+        auto it = bKids.find(LowerName(a, ca));
+        if (it == bKids.end()) {
+            RecordWholeSubtree(a, ca, path, false, changes, tally);
+        } else {
+            uint32_t cb = it->second;
+            bKids.erase(it);
+            if (a.IsDir(ca) != b.IsDir(cb)) { // type flipped: remove + add
+                RecordWholeSubtree(a, ca, path, false, changes, tally);
+                RecordWholeSubtree(b, cb, path, true, changes, tally);
+            } else if (a.IsDir(ca)) {
+                int64_t delta = (int64_t)b.Totals[cb].LogicalSize -
+                                (int64_t)a.Totals[ca].LogicalSize;
+                if (delta != 0)
+                    changes.push_back({path, delta, a.Totals[ca].LogicalSize,
+                                       b.Totals[cb].LogicalSize, true,
+                                       DiffChange::Changed});
+                DiffDirs(a, ca, b, cb, path, changes, tally, depth + 1);
+            } else if (a.Nodes[ca].LogicalSize != b.Nodes[cb].LogicalSize) {
+                changes.push_back({path,
+                                   (int64_t)b.Nodes[cb].LogicalSize -
+                                       (int64_t)a.Nodes[ca].LogicalSize,
+                                   a.Nodes[ca].LogicalSize,
+                                   b.Nodes[cb].LogicalSize, false,
+                                   DiffChange::Changed});
+            }
+        }
+        path.resize(len);
+    }
+
+    // Anything left in b had no counterpart in a: newly added.
+    for (const auto& [name, cb] : bKids) {
+        size_t len = path.size();
+        path += L'\\';
+        path += b.Name(cb);
+        RecordWholeSubtree(b, cb, path, true, changes, tally);
+        path.resize(len);
+    }
+}
+
+static std::string SignedSize(int64_t d) {
+    std::string mag = HumanSize((uint64_t)(d < 0 ? -d : d));
+    return (d < 0 ? "-" : "+") + mag;
+}
+
+static std::string FormatUnixTime(uint64_t t) {
+    if (!t) return "unknown time";
+    __time64_t tt = (__time64_t)t;
+    tm local{};
+    _localtime64_s(&local, &tt);
+    char buf[32];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &local);
+    return buf;
+}
+
+static int RunDiff(const std::wstring& oldSpec, const std::wstring& newSpec,
+                   int topN, unsigned threads) {
+    ScanResult a, b;
+    std::wstring err;
+    if (!LoadSnapshot(oldSpec, a, err)) {
+        fprintf(stderr, "error: %s\n", Utf8(err).c_str());
+        return 1;
+    }
+    // The "new" side can be a snapshot file or a drive to scan live.
+    bool live = newSpec.size() <= 3 && newSpec.size() >= 2 && newSpec[1] == L':';
+    if (live ? !ScanWithProgress(newSpec, threads, b, err)
+             : !LoadSnapshot(newSpec, b, err)) {
+        fprintf(stderr, "error: %s\n", Utf8(err).c_str());
+        return 1;
+    }
+    if (_wcsicmp(a.Drive.c_str(), b.Drive.c_str()) != 0)
+        printf("note: comparing different volumes (%s vs %s)\n\n",
+               Utf8(a.Drive).c_str(), Utf8(b.Drive).c_str());
+
+    std::vector<DiffChange> changes;
+    DiffTally tally;
+    std::wstring path = b.Drive;
+    DiffDirs(a, (uint32_t)kRootRecord, b, (uint32_t)kRootRecord, path, changes,
+             tally, 0);
+
+    const DirTotals& ra = a.Totals[kRootRecord];
+    const DirTotals& rb = b.Totals[kRootRecord];
+    printf("=== %s: %s -> %s ===\n", Utf8(b.Drive).c_str(),
+           FormatUnixTime(a.Stats.ScanUnixTime).c_str(),
+           FormatUnixTime(b.Stats.ScanUnixTime).c_str());
+    printf("Total size: %s -> %s (%s)\n", HumanSize(ra.LogicalSize).c_str(),
+           HumanSize(rb.LogicalSize).c_str(),
+           SignedSize((int64_t)rb.LogicalSize - (int64_t)ra.LogicalSize).c_str());
+    printf("Files: %llu -> %llu (+%llu added, -%llu removed)\n",
+           a.FileCount, b.FileCount, tally.FilesAdded, tally.FilesRemoved);
+    printf("Folders: %llu -> %llu (+%llu added, -%llu removed)\n",
+           a.DirCount, b.DirCount, tally.DirsAdded, tally.DirsRemoved);
+
+    size_t n = std::min<size_t>(topN, changes.size());
+    std::partial_sort(changes.begin(), changes.begin() + n, changes.end(),
+                      [](const DiffChange& x, const DiffChange& y) {
+                          return (x.Delta < 0 ? -x.Delta : x.Delta) >
+                                 (y.Delta < 0 ? -y.Delta : y.Delta);
+                      });
+    printf("\n=== Top %zu changes ===\n", n);
+    for (size_t i = 0; i < n; ++i) {
+        const DiffChange& c = changes[i];
+        const char* tag = c.What == DiffChange::Added     ? "added  "
+                          : c.What == DiffChange::Removed ? "removed"
+                          : c.IsDir                       ? "dir    "
+                                                          : "file   ";
+        printf("%12s  %s  %s", SignedSize(c.Delta).c_str(), tag,
+               Utf8(c.Path).c_str());
+        if (c.What == DiffChange::Changed && !c.IsDir)
+            printf("  (%s -> %s)", HumanSize(c.OldSize).c_str(),
+                   HumanSize(c.NewSize).c_str());
+        printf("\n");
+    }
+    if (changes.empty()) printf("(no changes)\n");
+    return 0;
 }
 
 // Resolve "C:\foo\bar" to its node index by descending the child index.
@@ -269,33 +451,44 @@ int wmain(int argc, wchar_t** argv) {
 
     std::vector<std::wstring> drives;
     int topN = 50;
-    bool exportAll = false;
-    std::wstring csvPath, jsonPath;
+    bool exportAll = false, forceWalk = false;
+    std::wstring csvPath, jsonPath, snapshotPath, diffOld, diffNew;
     unsigned threads = 0;
     for (int i = 1; i < argc; ++i) {
         std::wstring arg = argv[i];
-        if (arg == L"--top" && i + 1 < argc)          topN = _wtoi(argv[++i]);
-        else if (arg == L"--csv" && i + 1 < argc)     csvPath = argv[++i];
-        else if (arg == L"--json" && i + 1 < argc)    jsonPath = argv[++i];
-        else if (arg == L"--threads" && i + 1 < argc) threads = _wtoi(argv[++i]);
-        else if (arg == L"--all")                     exportAll = true;
+        if (arg == L"--top" && i + 1 < argc)           topN = _wtoi(argv[++i]);
+        else if (arg == L"--csv" && i + 1 < argc)      csvPath = argv[++i];
+        else if (arg == L"--json" && i + 1 < argc)     jsonPath = argv[++i];
+        else if (arg == L"--snapshot" && i + 1 < argc) snapshotPath = argv[++i];
+        else if (arg == L"--diff" && i + 2 < argc) {
+            diffOld = argv[++i];
+            diffNew = argv[++i];
+        }
+        else if (arg == L"--threads" && i + 1 < argc)  threads = _wtoi(argv[++i]);
+        else if (arg == L"--all")                      exportAll = true;
+        else if (arg == L"--walk")                     forceWalk = true;
         else if (arg == L"--debug-rescan" && i + 1 < argc) // hidden self-test
             return DebugRescan(argv[++i], threads);
         else if (arg == L"--help" || arg == L"-h") {
             printf("Usage: yadua.exe [drives...] [options]\n"
-                   "  drives       volumes to scan, e.g. C: D: (default C:)\n"
-                   "  --top N      how many entries per list (default 50)\n"
-                   "  --csv FILE   export to CSV (multiple drives: FILE_C.csv...)\n"
-                   "  --json FILE  export to JSON\n"
-                   "  --all        export the entire tree, not just the top-N\n"
-                   "               lists (CSV: one row per file/folder; JSON:\n"
-                   "               adds a nested \"tree\" object)\n"
-                   "  --threads N  parser threads (default: auto)\n"
-                   "Must be run from an elevated (Administrator) prompt.\n");
+                   "  drives           volumes to scan, e.g. C: D: (default C:)\n"
+                   "  --top N          how many entries per list (default 50)\n"
+                   "  --csv FILE       export to CSV (multiple drives: FILE_C.csv...)\n"
+                   "  --json FILE      export to JSON\n"
+                   "  --all            export the entire tree, not just the top-N\n"
+                   "                   lists (CSV: one row per file/folder; JSON:\n"
+                   "                   adds a nested \"tree\" object)\n"
+                   "  --snapshot FILE  save a snapshot (.ysnap) for later diffing\n"
+                   "  --diff OLD NEW   compare snapshots; NEW may be a drive to\n"
+                   "                   scan live (e.g. --diff before.ysnap C:)\n"
+                   "  --walk           force the directory-walk scanner\n"
+                   "  --threads N      parser threads (default: auto)\n"
+                   "Run from an elevated prompt for the fast raw-MFT scan.\n");
             return 0;
         }
         else if (!arg.empty() && arg[0] != L'-') drives.push_back(arg);
     }
+    if (!diffOld.empty()) return RunDiff(diffOld, diffNew, topN, threads);
     if (drives.empty()) drives.push_back(L"C:");
     const bool multi = drives.size() > 1;
 
@@ -308,7 +501,7 @@ int wmain(int argc, wchar_t** argv) {
     // Note: never printf("%ls") — the C-locale wide conversion silently
     // truncates output at the first non-ASCII character. Console output is
     // UTF-8 (SetConsoleOutputCP), so always go through Utf8().
-    if (!ScanWithProgress(drives[d], threads, r, error)) {
+    if (!ScanWithProgress(drives[d], threads, r, error, forceWalk)) {
         fprintf(stderr, "error: %s\n", Utf8(error).c_str());
         ++failures;
         continue;
@@ -395,6 +588,16 @@ int wmain(int argc, wchar_t** argv) {
             fclose(f);
             printf("JSON written to %s\n", Utf8(path).c_str());
         } else return 1;
+    }
+    if (!snapshotPath.empty()) {
+        std::wstring path = SuffixedPath(snapshotPath, r, multi);
+        std::wstring snapErr;
+        if (SaveSnapshot(r, path, snapErr))
+            printf("Snapshot written to %s\n", Utf8(path).c_str());
+        else {
+            fprintf(stderr, "error: %s\n", Utf8(snapErr).c_str());
+            return 1;
+        }
     }
 
     } // for each drive
