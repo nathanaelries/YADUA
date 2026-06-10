@@ -66,7 +66,10 @@
 
 - [x] Auto-elevation (GUI manifest requests Administrator; non-elevated
       scans still work via the directory-walk fallback)
-- [ ] Live updates via USN journal (track changes without rescanning)
+- [x] Live updates via USN journal: after an MFT scan the GUI watches the
+      change journal, shows a "live: N changes" counter, and Apply folds
+      the changes in by re-reading just the affected MFT records (no
+      rescan). Journal wrap/loss is detected and surfaced.
 - [x] Export/import scan snapshots; diff two scans over time
       (`--snapshot out.ysnap`, `--diff old.ysnap new.ysnap` or
       `--diff old.ysnap C:` to compare against a live scan; compact

@@ -13,7 +13,10 @@
 
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <unordered_set>
 #include <vector>
 
 namespace yadua {
@@ -56,6 +59,14 @@ struct ChildIndex {
     std::vector<uint32_t> List;
 };
 
+// One extent of the $MFT data stream on disk (Lcn < 0 = sparse). The map is
+// kept on the ScanResult so live updates can re-read individual records.
+struct MftExtent {
+    uint64_t Vcn;
+    int64_t  Lcn;
+    uint64_t Clusters;
+};
+
 struct ScanStats {
     uint64_t BytesRead     = 0;
     uint64_t RecordsParsed = 0;
@@ -86,6 +97,7 @@ struct ScanResult {
     std::vector<DirTotals> Totals;    // indexed like Nodes
     ChildIndex             Children;
     ScanStats              Stats;
+    std::vector<MftExtent> MftMap;         // raw-MFT scans only (else empty)
     std::wstring           FallbackReason; // why the MFT path was unavailable
     uint64_t               FileCount = 0;
     uint64_t               DirCount  = 0;
@@ -147,6 +159,41 @@ bool SaveSnapshot(const ScanResult& r, const std::wstring& file,
                   std::wstring& error);
 bool LoadSnapshot(const std::wstring& file, ScanResult& out,
                   std::wstring& error);
+
+// Watches the NTFS USN change journal on a background thread, accumulating
+// the file-reference numbers of records that changed since the scan. Pair
+// with ApplyMftUpdates to fold the changes into a ScanResult without a
+// rescan. Requires the same elevated access as the raw-MFT scan.
+class UsnMonitor {
+public:
+    ~UsnMonitor() { Stop(); }
+    bool Start(const std::wstring& drive, std::wstring& error);
+    void Stop();
+    bool Active() const { return active_.load(std::memory_order_relaxed); }
+    // The journal wrapped or became unavailable; a full rescan is needed.
+    bool Lost() const { return lost_.load(std::memory_order_relaxed); }
+    uint64_t Pending() const { return pending_.load(std::memory_order_relaxed); }
+    std::vector<uint64_t> TakeDirty(); // drains the dirty set
+
+private:
+    void Loop();
+
+    void*                        volume_ = nullptr; // HANDLE
+    std::thread                  thread_;
+    std::mutex                   mutex_;
+    std::unordered_set<uint64_t> dirty_;
+    std::atomic<bool>            stop_{false}, active_{false}, lost_{false};
+    std::atomic<uint64_t>        pending_{0};
+    uint64_t                     journalId_ = 0;
+    int64_t                      nextUsn_   = 0;
+};
+
+// Re-reads the given MFT records (file references from the USN journal) and
+// updates the tree in place: changed sizes, new files, deletions, renames.
+// `unresolved` counts records that could not be located (e.g. the MFT grew
+// past the mapped extents — a rescan picks those up). Runs Reindex.
+bool ApplyMftUpdates(ScanResult& r, const std::vector<uint64_t>& fileRefs,
+                     std::wstring& error, unsigned* unresolved = nullptr);
 
 // Formatting helpers shared by the frontends.
 std::string  Utf8(const std::wstring& w);

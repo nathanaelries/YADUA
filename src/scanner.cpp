@@ -163,7 +163,7 @@ bool ApplyFixups(uint8_t* rec, uint32_t recordSize) {
 // length field, high nibble = #bytes of LCN-delta field) followed by those
 // variable-width little-endian integers. The LCN delta is SIGNED and relative
 // to the previous run's LCN. A zero-width delta means a sparse run.
-struct Extent { uint64_t Vcn; int64_t Lcn; uint64_t Clusters; }; // Lcn < 0 => sparse
+using Extent = MftExtent; // Lcn < 0 => sparse
 
 std::vector<Extent> DecodeRunList(const uint8_t* p, const uint8_t* end,
                                   uint64_t startVcn) {
@@ -639,10 +639,13 @@ bool ResolveStreamOffset(const std::vector<Extent>& runs, uint32_t clusterSize,
 }
 
 // Reads one MFT record by number via the partial run map (cluster-aligned
-// read, fixups applied). Returns nullptr-equivalent via `false`.
+// read). Fixups are applied unless the caller will run the record through
+// ParseRecord, which applies them itself — applying fixups twice always
+// fails, because the first pass replaces the sector tails with real data.
 bool ReadMftRecord(HANDLE volume, const std::vector<Extent>& runs,
                    uint32_t clusterSize, uint32_t recordSize,
-                   uint64_t recordNumber, std::vector<uint8_t>& out) {
+                   uint64_t recordNumber, std::vector<uint8_t>& out,
+                   bool applyFixups = true) {
     uint64_t diskOffset = 0;
     if (!ResolveStreamOffset(runs, clusterSize, recordNumber * (uint64_t)recordSize,
                              diskOffset))
@@ -655,7 +658,8 @@ bool ReadMftRecord(HANDLE volume, const std::vector<Extent>& runs,
     out.assign(buf.begin() + (diskOffset - alignedStart),
                buf.begin() + (diskOffset - alignedStart) + recordSize);
     auto* hdr = reinterpret_cast<FileRecordHeader*>(out.data());
-    return hdr->Magic == kFileRecordMagic && ApplyFixups(out.data(), recordSize);
+    if (hdr->Magic != kFileRecordMagic) return false;
+    return !applyFixups || ApplyFixups(out.data(), recordSize);
 }
 
 // Extends `runs` with the $DATA portions held in extension records named by
@@ -990,6 +994,7 @@ bool ScanVolume(const std::wstring& driveIn, unsigned threads, ScanResult& out,
     }
 
     // ---- 4 & 5. Stream the MFT and parse every record in parallel ---------
+    out.MftMap = mftRuns; // retained so USN live updates can re-read records
     out.Nodes.assign(mftBytes / recordSize, Node{});
     std::vector<ParseContext> contexts;
     if (!StreamMft(volume, mftRuns, mftBytes, clusterSize, recordSize,
@@ -1323,6 +1328,171 @@ bool LoadSnapshot(const std::wstring& file, ScanResult& out,
     fclose(f);
     out.Nodes[kRootRecord].Flags |= kNodeIsDir; // the root is always a dir
     Reindex(out);
+    return true;
+}
+
+// ============================================================================
+// USN journal monitoring + incremental updates
+// ============================================================================
+
+bool UsnMonitor::Start(const std::wstring& drive, std::wstring& error) {
+    Stop();
+    std::wstring volumePath = L"\\\\.\\" + drive;
+    HANDLE volume = CreateFileW(volumePath.c_str(), GENERIC_READ,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                OPEN_EXISTING, 0, nullptr);
+    if (volume == INVALID_HANDLE_VALUE) {
+        error = Format(L"cannot open %ls for journal monitoring (error %lu)",
+                       volumePath.c_str(), GetLastError());
+        return false;
+    }
+    USN_JOURNAL_DATA_V0 journal{};
+    DWORD bytes = 0;
+    if (!DeviceIoControl(volume, FSCTL_QUERY_USN_JOURNAL, nullptr, 0,
+                         &journal, sizeof(journal), &bytes, nullptr)) {
+        error = Format(L"volume %ls has no readable USN journal (error %lu)",
+                       drive.c_str(), GetLastError());
+        CloseHandle(volume);
+        return false;
+    }
+    volume_    = volume;
+    journalId_ = journal.UsnJournalID;
+    nextUsn_   = journal.NextUsn; // only changes from this point onward
+    stop_      = false;
+    lost_      = false;
+    pending_   = 0;
+    dirty_.clear();
+    thread_ = std::thread(&UsnMonitor::Loop, this);
+    active_ = true;
+    return true;
+}
+
+void UsnMonitor::Stop() {
+    stop_ = true;
+    if (thread_.joinable()) thread_.join();
+    if (volume_) {
+        CloseHandle((HANDLE)volume_);
+        volume_ = nullptr;
+    }
+    active_ = false;
+}
+
+std::vector<uint64_t> UsnMonitor::TakeDirty() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<uint64_t> out(dirty_.begin(), dirty_.end());
+    dirty_.clear();
+    pending_ = 0;
+    return out;
+}
+
+void UsnMonitor::Loop() {
+    std::vector<uint8_t> buffer(256 * 1024);
+    while (!stop_) {
+        READ_USN_JOURNAL_DATA_V0 request{};
+        request.StartUsn          = nextUsn_;
+        request.ReasonMask        = 0xFFFFFFFF;
+        request.UsnJournalID      = journalId_;
+        // BytesToWaitFor == 0: return immediately with whatever is available.
+        DWORD bytes = 0;
+        if (!DeviceIoControl((HANDLE)volume_, FSCTL_READ_USN_JOURNAL,
+                             &request, sizeof(request), buffer.data(),
+                             (DWORD)buffer.size(), &bytes, nullptr)) {
+            // Journal wrapped past our cursor, was deleted, or the volume
+            // went away: incremental tracking is no longer sound.
+            lost_ = true;
+            return;
+        }
+        if (bytes >= sizeof(USN)) {
+            nextUsn_ = *reinterpret_cast<USN*>(buffer.data());
+            size_t offset = sizeof(USN);
+            std::lock_guard<std::mutex> lock(mutex_);
+            while (offset + sizeof(USN_RECORD_V2) <= bytes) {
+                auto* rec = reinterpret_cast<USN_RECORD_V2*>(buffer.data() + offset);
+                if (rec->RecordLength < sizeof(USN_RECORD_V2) ||
+                    offset + rec->RecordLength > bytes)
+                    break;
+                if (rec->MajorVersion == 2) {
+                    dirty_.insert(rec->FileReferenceNumber);
+                } else if (rec->MajorVersion == 3) {
+                    // V3 uses 128-bit ids; NTFS only populates the low 64.
+                    auto* v3 = reinterpret_cast<USN_RECORD_V3*>(rec);
+                    uint64_t low;
+                    memcpy(&low, v3->FileReferenceNumber.Identifier, 8);
+                    dirty_.insert(low);
+                }
+                offset += rec->RecordLength;
+            }
+            pending_ = dirty_.size();
+        }
+        // Nothing more to read right now (or a tiny batch): poll politely.
+        for (int i = 0; i < 10 && !stop_; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
+bool ApplyMftUpdates(ScanResult& r, const std::vector<uint64_t>& fileRefs,
+                     std::wstring& error, unsigned* unresolved) {
+    if (unresolved) *unresolved = 0;
+    if (r.MftMap.empty() || !r.Stats.RecordSize) {
+        error = L"this result has no MFT map (fallback scan or snapshot)";
+        return false;
+    }
+    if (fileRefs.empty()) return true;
+
+    std::wstring volumePath = L"\\\\.\\" + r.Drive;
+    HANDLE volume = CreateFileW(volumePath.c_str(), GENERIC_READ,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                OPEN_EXISTING, 0, nullptr);
+    if (volume == INVALID_HANDLE_VALUE) {
+        error = Format(L"cannot open %ls (error %lu)", volumePath.c_str(),
+                       GetLastError());
+        return false;
+    }
+
+    ParseContext ctx;
+    ctx.Nodes = &r.Nodes;
+    std::vector<uint32_t> updated;
+    updated.reserve(fileRefs.size());
+
+    for (uint64_t ref : fileRefs) {
+        uint64_t recno = ref & 0x0000FFFFFFFFFFFFull;
+        if (recno >= 0xFFFFFFFFull) continue;
+        // New files may land in records past the original scan; make room.
+        if (recno >= r.Nodes.size()) {
+            // Past the mapped MFT extents: ReadMftRecord below will fail and
+            // count as unresolved, but in-range growth is fine.
+            r.Nodes.resize(recno + 1);
+        }
+        r.Nodes[(size_t)recno] = Node{}; // deleted unless re-read succeeds
+
+        std::vector<uint8_t> rec;
+        if (!ReadMftRecord(volume, r.MftMap, r.Stats.ClusterSize,
+                           r.Stats.RecordSize, recno, rec,
+                           /*applyFixups=*/false)) { // ParseRecord fixes up
+            if (unresolved) ++*unresolved;
+            continue;
+        }
+        // ParseRecord applies fixups and checks in-use (a deleted file
+        // simply leaves the node zeroed).
+        ParseRecord(rec.data(), r.Stats.RecordSize, recno, ctx);
+        if (r.Nodes[(size_t)recno].Flags & kNodeNamed)
+            updated.push_back((uint32_t)recno);
+    }
+    CloseHandle(volume);
+
+    // Names were appended to the context arena; merge and rebase.
+    uint32_t base = (uint32_t)r.NameArena.size();
+    r.NameArena.insert(r.NameArena.end(), ctx.NameArena.begin(),
+                       ctx.NameArena.end());
+    for (uint32_t recno : updated) r.Nodes[recno].NameOffset += base;
+    // Extension-record contributions (large fragmented files).
+    for (const ParseContext::Contribution& c : ctx.Deferred) {
+        r.Nodes[c.Target].LogicalSize   += c.Logical;
+        r.Nodes[c.Target].AllocatedSize += c.Allocated;
+    }
+
+    Reindex(r);
+    r.Stats.ScanUnixTime = (uint64_t)_time64(nullptr);
     return true;
 }
 

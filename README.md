@@ -54,6 +54,9 @@ Launch `yadua-gui.exe` (it requests elevation itself), pick a drive, hit Scan.
 - **Right-click** (both views) — Open in Explorer, Copy path, Properties,
   Delete to Recycle Bin (with confirmation; the view updates in place,
   no rescan needed), and per-folder Rescan to refresh one subtree.
+- **Live updates** — after an MFT scan the toolbar tracks filesystem
+  changes via the NTFS USN journal ("live: N changes"); Apply folds them
+  in by re-reading only the affected MFT records, in well under a second.
 
 ## Scan modes
 

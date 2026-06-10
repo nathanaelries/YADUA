@@ -98,6 +98,17 @@ struct App {
     std::wstring        RescanPath;  // for the progress display
     std::wstring        RescanError; // written by the worker before RescanDone
     yadua::ScanProgress RescanProgress;
+
+    // USN live updates: the monitor counts filesystem changes since the scan;
+    // Apply folds them in by re-reading just the affected MFT records (same
+    // UI gating as a rescan while Result mutates).
+    yadua::UsnMonitor Monitor;
+    bool              Applying = false;
+    std::atomic<bool> ApplyDone{false};
+    std::thread       ApplyThread;
+    std::wstring      ApplyError;
+    unsigned          ApplyUnresolved = 0;
+    size_t            ApplyCount      = 0;
 };
 
 // All fixed drives: NTFS gets the fast MFT scan, anything else (or a
@@ -114,8 +125,10 @@ static void ListFixedDrives(App& app) {
 }
 
 static void StartScan(App& app) {
-    if (app.Scanning || app.Deleting || app.Rescanning || app.Drives.empty())
+    if (app.Scanning || app.Deleting || app.Rescanning || app.Applying ||
+        app.Drives.empty())
         return;
+    app.Monitor.Stop(); // a fresh scan resets the change-tracking baseline
     if (app.ScanThread.joinable()) app.ScanThread.join();
     app.Pending = std::make_unique<yadua::ScanResult>();
     app.Progress.BytesRead  = 0;
@@ -291,8 +304,29 @@ static void ApplySort(App& app, const ImGuiTableColumnSortSpecs& spec) {
 // Deletion (Recycle Bin)
 // ============================================================================
 
+static void StartApply(App& app) {
+    if (app.Applying || app.Scanning || app.Deleting || app.Rescanning ||
+        !app.Result)
+        return;
+    if (app.ApplyThread.joinable()) app.ApplyThread.join();
+    app.ApplyError.clear();
+    app.ApplyDone = false;
+    app.Applying  = true;
+    app.ApplyThread = std::thread([&app] {
+        std::vector<uint64_t> dirty = app.Monitor.TakeDirty();
+        app.ApplyCount = dirty.size();
+        std::wstring err;
+        if (!yadua::ApplyMftUpdates(*app.Result, dirty, err,
+                                    &app.ApplyUnresolved))
+            app.ApplyError = err;
+        app.ApplyDone = true;
+    });
+}
+
 static void StartRescan(App& app, uint32_t node) {
-    if (app.Rescanning || app.Scanning || app.Deleting || !app.Result) return;
+    if (app.Rescanning || app.Scanning || app.Deleting || app.Applying ||
+        !app.Result)
+        return;
     if (app.RescanThread.joinable()) app.RescanThread.join();
     app.RescanPath  = app.Result->Path(node);
     app.RescanError.clear();
@@ -307,7 +341,9 @@ static void StartRescan(App& app, uint32_t node) {
 }
 
 static void StartDelete(App& app, uint32_t node) {
-    if (app.Deleting || app.Scanning || app.Rescanning || !app.Result) return;
+    if (app.Deleting || app.Scanning || app.Rescanning || app.Applying ||
+        !app.Result)
+        return;
     if (app.DeleteThread.joinable()) app.DeleteThread.join();
     app.DeleteNode   = node;
     app.DeletePath   = app.Result->Path(node);
@@ -640,6 +676,20 @@ static void DrawUi(App& app) {
                               "scan used the slower directory walk.",
                               yadua::Utf8(app.Result->FallbackReason).c_str());
     }
+    if (app.Result && !app.Rescanning && !app.Applying && app.Monitor.Active()) {
+        ImGui::SameLine();
+        if (app.Monitor.Lost()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f),
+                               "| live updates lost - rescan");
+        } else {
+            uint64_t pending = app.Monitor.Pending();
+            ImGui::TextDisabled("| live: %llu changes", pending);
+            if (pending) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Apply")) StartApply(app);
+            }
+        }
+    }
     if (!app.Status.empty()) {
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1.0f), "| %s",
@@ -648,7 +698,13 @@ static void DrawUi(App& app) {
     ImGui::Separator();
 
     // ---- Body ---------------------------------------------------------------
-    if (app.Rescanning) {
+    if (app.Applying) {
+        // ApplyMftUpdates is mutating Result on a worker thread.
+        ImGui::NewLine();
+        ImGui::TextUnformatted("Applying filesystem changes...");
+        ImGui::ProgressBar(-1.0f * (float)ImGui::GetTime(),
+                           ImVec2(ImGui::GetFontSize() * 25.0f, 0.0f));
+    } else if (app.Rescanning) {
         // The worker is mutating Result in place: render nothing that reads it.
         uint64_t found = app.RescanProgress.BytesRead.load(std::memory_order_relaxed);
         int stage = app.RescanProgress.Stage.load(std::memory_order_relaxed);
@@ -900,6 +956,25 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
         }
 
         if (app.AutoScan) { app.AutoScan = false; StartScan(app); }
+        if (app.Applying && app.ApplyDone) {
+            app.ApplyThread.join();
+            app.Applying = false;
+            if (app.ApplyError.empty()) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "Applied %zu changes%s",
+                         app.ApplyCount,
+                         app.ApplyUnresolved ? " (some unresolved - rescan "
+                                               "for full accuracy)" : "");
+                app.Status = buf;
+                if (!app.Result->Exists(app.Treemap.Root())) app.Treemap.Reset();
+                app.Treemap.Invalidate();
+                app.UseSorted = false;
+                app.SortedChildren.clear();
+                RecomputeFilter(app);
+            } else {
+                app.Status = "Apply failed: " + yadua::Utf8(app.ApplyError);
+            }
+        }
         if (app.Rescanning && app.RescanDone) {
             app.RescanThread.join();
             app.Rescanning = false;
@@ -923,6 +998,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
                 app.Treemap.Reset();
                 app.Status.clear();
                 RecomputeFilter(app);
+                // Raw-MFT scans can track live changes via the USN journal.
+                if (!app.Result->MftMap.empty()) {
+                    std::wstring monErr;
+                    app.Monitor.Start(app.Result->Drive, monErr); // best effort
+                }
             } else {
                 app.Error = std::move(app.PendingError);
                 app.PendingError.clear();
@@ -942,9 +1022,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
         g_swapChain->Present(1, 0); // vsync
     }
 
+    app.Monitor.Stop();
     if (app.ScanThread.joinable()) app.ScanThread.join();
     if (app.DeleteThread.joinable()) app.DeleteThread.join();
     if (app.RescanThread.joinable()) app.RescanThread.join();
+    if (app.ApplyThread.joinable()) app.ApplyThread.join();
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();

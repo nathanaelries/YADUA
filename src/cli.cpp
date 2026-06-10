@@ -442,6 +442,82 @@ static int DebugRescan(const std::wstring& path, unsigned threads) {
     return 0;
 }
 
+// Hidden self-test for the USN live-update pipeline: scan, create a file,
+// apply the journal deltas, verify the node appears; delete it, apply again,
+// verify it disappears.
+static int DebugUsn(unsigned threads) {
+    ScanResult r;
+    std::wstring err;
+    wchar_t tempDir[MAX_PATH], longDir[MAX_PATH];
+    GetTempPathW(MAX_PATH, tempDir);
+    // GetTempPathW often returns 8.3 short names (NATHAN~1); the tree stores
+    // long Win32 names, so expand before looking the file up by path.
+    if (!GetLongPathNameW(tempDir, longDir, MAX_PATH)) wcscpy_s(longDir, tempDir);
+    std::wstring testFile = std::wstring(longDir) + L"yadua_usn_test.bin";
+    std::wstring drive = testFile.substr(0, 2);
+
+    if (!ScanWithProgress(drive, threads, r, err)) {
+        fprintf(stderr, "error: %s\n", Utf8(err).c_str());
+        return 1;
+    }
+    if (r.Stats.UsedFallback) {
+        fprintf(stderr, "debug-usn requires the raw-MFT scan (run elevated)\n");
+        return 1;
+    }
+
+    UsnMonitor monitor;
+    if (!monitor.Start(r.Drive, err)) {
+        fprintf(stderr, "monitor: %s\n", Utf8(err).c_str());
+        return 1;
+    }
+    printf("monitor started on %s\n", Utf8(r.Drive).c_str());
+
+    // Force file + volume metadata to disk so the raw MFT read sees it.
+    auto flushVolume = [&] {
+        HANDLE v = CreateFileW((L"\\\\.\\" + r.Drive).c_str(), GENERIC_WRITE,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                               OPEN_EXISTING, 0, nullptr);
+        if (v != INVALID_HANDLE_VALUE) { FlushFileBuffers(v); CloseHandle(v); }
+    };
+    auto applyAndFind = [&](const char* phase) -> int64_t {
+        flushVolume();
+        Sleep(3000);
+        std::vector<uint64_t> dirty = monitor.TakeDirty();
+        unsigned unresolved = 0;
+        std::wstring applyErr;
+        if (!ApplyMftUpdates(r, dirty, applyErr, &unresolved)) {
+            fprintf(stderr, "apply: %s\n", Utf8(applyErr).c_str());
+            return -2;
+        }
+        uint32_t node = FindNodeByPath(r, testFile);
+        std::string state =
+            node == UINT32_MAX
+                ? std::string("ABSENT")
+                : "present, " + HumanSize(r.Nodes[node].LogicalSize);
+        printf("%s: %zu dirty records applied (%u unresolved), file %s\n",
+               phase, dirty.size(), unresolved, state.c_str());
+        return node == UINT32_MAX ? -1 : (int64_t)r.Nodes[node].LogicalSize;
+    };
+
+    FILE* f = _wfopen(testFile.c_str(), L"wb");
+    if (!f) { fprintf(stderr, "cannot create test file\n"); return 1; }
+    std::vector<char> block(1 << 20, 'y');
+    for (int i = 0; i < 8; ++i) fwrite(block.data(), 1, block.size(), f);
+    fclose(f);
+
+    int64_t size = applyAndFind("after create");
+    bool createOk = size == 8 * (1 << 20);
+
+    DeleteFileW(testFile.c_str());
+    int64_t gone = applyAndFind("after delete");
+    bool deleteOk = gone == -1;
+
+    monitor.Stop();
+    printf("create tracked: %s   delete tracked: %s\n",
+           createOk ? "OK" : "FAIL", deleteOk ? "OK" : "FAIL");
+    return createOk && deleteOk ? 0 : 1;
+}
+
 // ============================================================================
 // main
 // ============================================================================
@@ -469,6 +545,8 @@ int wmain(int argc, wchar_t** argv) {
         else if (arg == L"--walk")                     forceWalk = true;
         else if (arg == L"--debug-rescan" && i + 1 < argc) // hidden self-test
             return DebugRescan(argv[++i], threads);
+        else if (arg == L"--debug-usn")                    // hidden self-test
+            return DebugUsn(threads);
         else if (arg == L"--help" || arg == L"-h") {
             printf("Usage: yadua.exe [drives...] [options]\n"
                    "  drives           volumes to scan, e.g. C: D: (default C:)\n"
