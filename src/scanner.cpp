@@ -265,24 +265,43 @@ void ParseRecord(uint8_t* rec, uint32_t recordSize, uint64_t recordIndex,
                                          name, name + fn->NameLength);
                 }
             }
-        } else if (attr->Type == kAttrData && attr->NameLength == 0) {
-            // Unnamed $DATA = the file's main contents. Named $DATA attributes
-            // are Alternate Data Streams — skipped on purpose (this also dodges
-            // $BadClus:$Bad, a sparse ADS the size of the whole volume!).
-            if (attr->NonResident) {
+        } else if (attr->Type == kAttrData) {
+            // Unnamed $DATA = the file's main contents; named $DATA attributes
+            // are Alternate Data Streams, which also occupy space. Metafile
+            // ADS are skipped entirely: $BadClus:$Bad logically spans the
+            // whole volume (and is not reliably sparse-*flagged*), $Secure's
+            // streams are filesystem metadata, not user data.
+            bool isAds = attr->NameLength != 0;
+            if (isAds && targetIndex < kFirstUserRecord) {
+                // skip
+            } else if (attr->NonResident) {
                 auto* nr = reinterpret_cast<NonResidentAttribute*>(attr);
                 // Only the header with LowestVcn == 0 carries the stream's
                 // total sizes; continuation headers in extension records
                 // repeat nothing and must not be double-counted.
                 if (nr->LowestVcn == 0 && offset + sizeof(NonResidentAttribute) <= limit) {
-                    addLogical   += nr->RealSize;
-                    addAllocated += nr->AllocatedSize;
+                    // Sparse/compressed: AllocatedSize is just the reserved
+                    // VCN span; actual disk usage is TotalAllocated (0x40).
+                    uint64_t allocated = nr->AllocatedSize;
+                    if ((attr->Flags & (kAttrFlagSparse | kAttrFlagCompressed)) &&
+                        attr->Length >= kTotalAllocatedOffset + 8 &&
+                        offset + kTotalAllocatedOffset + 8 <= limit)
+                        memcpy(&allocated, rec + offset + kTotalAllocatedOffset, 8);
+                    addAllocated += allocated;
+                    if (!isAds || !(attr->Flags & kAttrFlagSparse))
+                        addLogical += nr->RealSize;
                 }
             } else {
                 auto* res = reinterpret_cast<ResidentAttribute*>(attr);
                 addLogical += res->ValueLength;
                 // resident data occupies no clusters of its own => allocated 0
             }
+        } else if (attr->Type == kAttrIndexAllocation && attr->NonResident) {
+            // Directory index ($I30) clusters: real disk usage that Explorer
+            // ignores but the volume's free-space accounting doesn't.
+            auto* nr = reinterpret_cast<NonResidentAttribute*>(attr);
+            if (nr->LowestVcn == 0 && offset + sizeof(NonResidentAttribute) <= limit)
+                addAllocated += nr->AllocatedSize;
         }
 
         offset += attr->Length;
@@ -540,9 +559,16 @@ void Aggregate(ScanResult& r) {
     for (size_t i = 0; i < r.Nodes.size(); ++i) {
         const Node& n = r.Nodes[i];
         if (!(n.Flags & kNodeInUse) || !(n.Flags & kNodeNamed)) continue;
-        if (i == kRootRecord) continue;
 
         bool isDir = (n.Flags & kNodeIsDir) != 0;
+        if (isDir) {
+            // A directory's *own* bytes (its $I30 index clusters, rarely an
+            // unnamed $DATA) belong in its cumulative total too; ancestors
+            // pick them up through the walk below.
+            r.Totals[i].LogicalSize   += n.LogicalSize;
+            r.Totals[i].AllocatedSize += n.AllocatedSize;
+        }
+        if (i == kRootRecord) continue;
         if (isDir) ++r.DirCount; else ++r.FileCount;
 
         uint32_t cur = n.Parent;
@@ -876,6 +902,194 @@ bool ScanVolume(const std::wstring& driveIn, unsigned threads, ScanResult& out,
     if (progress)
         progress->Stage.store(ScanProgress::Done, std::memory_order_relaxed);
     return true;
+}
+
+// ============================================================================
+// ScanVolumeFallback — multi-threaded FindFirstFileExW directory walk
+//
+// Used when raw volume access is impossible (no admin rights, non-NTFS
+// filesystem). Builds the exact same ScanResult shape as the MFT path: the
+// root sits at index kRootRecord (indices 0-4 are unused placeholders), all
+// sequence numbers are 1, and Aggregate/BuildChildIndex run unchanged.
+// ============================================================================
+
+bool ScanVolumeFallback(const std::wstring& driveIn, unsigned threads,
+                        ScanResult& out, std::wstring& error,
+                        ScanProgress* progress) {
+    auto t0 = std::chrono::steady_clock::now();
+    out = ScanResult{};
+    out.Drive = driveIn;
+    if (out.Drive.size() == 1) out.Drive += L':';
+    if (out.Drive.size() > 2 && out.Drive.back() == L'\\') out.Drive.pop_back();
+    out.Stats.UsedFallback = true;
+
+    std::wstring rootDir = out.Drive + L"\\";
+    if (GetFileAttributesW(rootDir.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        error = Format(L"cannot access %ls (error %lu)", rootDir.c_str(),
+                       GetLastError());
+        return false;
+    }
+
+    // Cluster size, for approximating "size on disk" (FindFirstFile reports
+    // only logical sizes; compressed/sparse files will be overestimated).
+    DWORD sectorsPerCluster = 0, bytesPerSector = 0, freeC = 0, totalC = 0;
+    GetDiskFreeSpaceW(rootDir.c_str(), &sectorsPerCluster, &bytesPerSector,
+                      &freeC, &totalC);
+    const uint64_t clusterSize =
+        sectorsPerCluster && bytesPerSector
+            ? (uint64_t)sectorsPerCluster * bytesPerSector : 4096;
+    out.Stats.ClusterSize = (uint32_t)clusterSize;
+
+    // Directory walks are latency-bound, so more threads than cores helps.
+    if (threads == 0) {
+        unsigned hw = std::thread::hardware_concurrency();
+        threads = hw ? std::min(hw * 2, 16u) : 4u;
+    }
+    out.Stats.Threads = threads;
+    if (progress)
+        progress->Stage.store(ScanProgress::Reading, std::memory_order_relaxed);
+
+    // Root node at the index everything downstream expects.
+    out.Nodes.resize(kRootRecord + 1);
+    {
+        Node& root = out.Nodes[kRootRecord];
+        root.Flags      = kNodeInUse | kNodeIsDir | kNodeNamed;
+        root.Sequence   = 1;
+        root.Parent     = (uint32_t)kRootRecord;
+        root.ParentSeq  = 1;
+        root.NameOffset = 0;
+        root.NameLength = 1;
+        out.NameArena.push_back(L'.');
+    }
+
+    // Work queue of (directory path with \\?\ prefix, its node index).
+    // `pending` counts queued + in-flight directories; 0 means finished.
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<std::pair<std::wstring, uint32_t>> work;
+    size_t pending = 1;
+    work.emplace_back(L"\\\\?\\" + out.Drive, (uint32_t)kRootRecord);
+
+    struct Entry {
+        std::wstring Name;
+        uint64_t Size;
+        bool IsDir;
+        bool IsReparse;
+    };
+
+    auto worker = [&] {
+        std::vector<Entry> entries;
+        for (;;) {
+            std::unique_lock<std::mutex> lock(mutex);
+            cv.wait(lock, [&] { return !work.empty() || pending == 0; });
+            if (work.empty()) return; // pending == 0: all done
+            auto [dirPath, dirNode] = std::move(work.front());
+            work.pop_front();
+            lock.unlock();
+
+            // Enumerate outside the lock — this is where the time goes.
+            entries.clear();
+            WIN32_FIND_DATAW fd;
+            HANDLE find = FindFirstFileExW((dirPath + L"\\*").c_str(),
+                                           FindExInfoBasic, &fd,
+                                           FindExSearchNameMatch, nullptr,
+                                           FIND_FIRST_EX_LARGE_FETCH);
+            if (find != INVALID_HANDLE_VALUE) {
+                do {
+                    if (fd.cFileName[0] == L'.' &&
+                        (fd.cFileName[1] == L'\0' ||
+                         (fd.cFileName[1] == L'.' && fd.cFileName[2] == L'\0')))
+                        continue;
+                    entries.push_back(
+                        {fd.cFileName,
+                         ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow,
+                         (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0,
+                         (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0});
+                } while (FindNextFileW(find, &fd));
+                FindClose(find);
+            }
+            // else: access denied etc. — skip silently, like every walker must
+
+            lock.lock();
+            for (const Entry& e : entries) {
+                uint32_t idx = (uint32_t)out.Nodes.size();
+                Node n;
+                n.Flags      = kNodeInUse | kNodeNamed;
+                n.Sequence   = 1;
+                n.Parent     = dirNode;
+                n.ParentSeq  = 1;
+                n.NameOffset = (uint32_t)out.NameArena.size();
+                n.NameLength = (uint16_t)e.Name.size();
+                if (e.IsReparse) n.Flags |= kNodeReparse;
+                if (e.IsDir) {
+                    n.Flags |= kNodeIsDir;
+                } else {
+                    n.LogicalSize   = e.Size;
+                    n.AllocatedSize = (e.Size + clusterSize - 1)
+                                      / clusterSize * clusterSize;
+                }
+                out.NameArena.insert(out.NameArena.end(),
+                                     e.Name.begin(), e.Name.end());
+                out.Nodes.push_back(n);
+                // Never descend into reparse points: junction cycles would
+                // loop forever and their targets are counted where they live.
+                if (e.IsDir && !e.IsReparse) {
+                    work.emplace_back(dirPath + L"\\" + e.Name, idx);
+                    ++pending;
+                }
+            }
+            --pending; // this directory is done
+            if (progress)
+                progress->BytesRead.fetch_add(entries.size(),
+                                              std::memory_order_relaxed);
+            bool finished = pending == 0 && work.empty();
+            lock.unlock();
+            if (finished) cv.notify_all();
+            else cv.notify_one();
+        }
+    };
+
+    std::vector<std::thread> pool;
+    pool.reserve(threads);
+    for (unsigned t = 0; t < threads; ++t) pool.emplace_back(worker);
+    for (std::thread& t : pool) t.join();
+
+    out.Stats.RecordsParsed = out.Nodes.size() - (kRootRecord + 1);
+    auto t1 = std::chrono::steady_clock::now();
+    out.Stats.StreamSeconds =
+        std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1e6;
+    if (progress)
+        progress->Stage.store(ScanProgress::Aggregating, std::memory_order_relaxed);
+
+    Aggregate(out);
+    BuildChildIndex(out);
+
+    auto t2 = std::chrono::steady_clock::now();
+    out.Stats.TotalSeconds =
+        std::chrono::duration_cast<std::chrono::microseconds>(t2 - t0).count() / 1e6;
+    if (progress)
+        progress->Stage.store(ScanProgress::Done, std::memory_order_relaxed);
+    return true;
+}
+
+bool ScanVolumeAuto(const std::wstring& drive, unsigned threads,
+                    ScanResult& out, std::wstring& error,
+                    ScanProgress* progress) {
+    std::wstring mftError;
+    if (ScanVolume(drive, threads, out, mftError, progress)) return true;
+
+    if (progress) { // reset for the second attempt
+        progress->BytesRead  = 0;
+        progress->TotalBytes = 0;
+        progress->Stage      = ScanProgress::Opening;
+    }
+    std::wstring walkError;
+    if (ScanVolumeFallback(drive, threads, out, walkError, progress)) {
+        out.FallbackReason = mftError;
+        return true;
+    }
+    error = mftError + L"; directory-walk fallback also failed: " + walkError;
+    return false;
 }
 
 } // namespace yadua

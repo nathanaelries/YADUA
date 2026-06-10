@@ -91,16 +91,14 @@ struct App {
     std::string       Status;               // last action feedback, UTF-8
 };
 
-static void ListNtfsDrives(App& app) {
+// All fixed drives: NTFS gets the fast MFT scan, anything else (or a
+// non-elevated run) automatically uses the directory-walk fallback.
+static void ListFixedDrives(App& app) {
     DWORD mask = GetLogicalDrives();
     for (wchar_t letter = L'A'; letter <= L'Z'; ++letter) {
         if (!(mask & (1u << (letter - L'A')))) continue;
         std::wstring root{letter, L':', L'\\'};
         if (GetDriveTypeW(root.c_str()) != DRIVE_FIXED) continue;
-        wchar_t fs[MAX_PATH] = {};
-        if (!GetVolumeInformationW(root.c_str(), nullptr, 0, nullptr, nullptr,
-                                   nullptr, fs, MAX_PATH)) continue;
-        if (wcscmp(fs, L"NTFS") != 0) continue;
         app.Drives.push_back(std::wstring{letter, L':'});
         app.DriveLabels.push_back(yadua::Utf8(app.Drives.back()));
     }
@@ -119,7 +117,7 @@ static void StartScan(App& app) {
     std::wstring drive = app.Drives[app.DriveIndex];
     app.ScanThread = std::thread([&app, drive] {
         std::wstring err;
-        if (!yadua::ScanVolume(drive, 0, *app.Pending, err, &app.Progress))
+        if (!yadua::ScanVolumeAuto(drive, 0, *app.Pending, err, &app.Progress))
             app.PendingError = err;
         app.ScanDone = true; // release: PendingError/Pending written before this
     });
@@ -592,12 +590,19 @@ static void DrawUi(App& app) {
 
     if (app.Result) {
         ImGui::SameLine();
-        ImGui::TextDisabled("| %llu files, %llu folders, %s  (scanned in %.2f s)",
+        ImGui::TextDisabled("| %llu files, %llu folders, %s  (scanned in %.2f s%s)",
                             app.Result->FileCount, app.Result->DirCount,
                             yadua::HumanSize(
                                 app.Result->Totals[yadua::kRootRecord].LogicalSize)
                                 .c_str(),
-                            app.Result->Stats.TotalSeconds);
+                            app.Result->Stats.TotalSeconds,
+                            app.Result->Stats.UsedFallback
+                                ? ", directory walk" : "");
+        if (app.Result->Stats.UsedFallback &&
+            ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+            ImGui::SetTooltip("Raw MFT access was unavailable (%s), so this "
+                              "scan used the slower directory walk.",
+                              yadua::Utf8(app.Result->FallbackReason).c_str());
     }
     if (!app.Status.empty()) {
         ImGui::SameLine();
@@ -611,16 +616,28 @@ static void DrawUi(App& app) {
         int stage = app.Progress.Stage.load(std::memory_order_relaxed);
         uint64_t read  = app.Progress.BytesRead.load(std::memory_order_relaxed);
         uint64_t total = app.Progress.TotalBytes.load(std::memory_order_relaxed);
-        const char* what = stage <= yadua::ScanProgress::Reading
-                               ? "Reading MFT..." : "Building tree...";
+        bool walking = total == 0 && stage <= yadua::ScanProgress::Reading;
+        const char* what = stage >= yadua::ScanProgress::Aggregating
+                               ? "Building tree..."
+                               : walking ? "Scanning directories..."
+                                         : "Reading MFT...";
         ImGui::NewLine();
         ImGui::TextUnformatted(what);
-        float frac = total ? (float)((double)read / (double)total) : 0.0f;
-        if (stage >= yadua::ScanProgress::Aggregating) frac = 1.0f;
         char overlay[64];
-        snprintf(overlay, sizeof(overlay), "%s / %s",
-                 yadua::HumanSize(read).c_str(), yadua::HumanSize(total).c_str());
-        ImGui::ProgressBar(frac, ImVec2(ImGui::GetFontSize() * 25.0f, 0.0f), overlay);
+        float frac;
+        if (stage >= yadua::ScanProgress::Aggregating) {
+            frac = 1.0f;
+            overlay[0] = '\0';
+        } else if (walking) { // total unknown: indeterminate bar + entry count
+            frac = -1.0f * (float)ImGui::GetTime();
+            snprintf(overlay, sizeof(overlay), "%llu entries", read);
+        } else {
+            frac = (float)((double)read / (double)total);
+            snprintf(overlay, sizeof(overlay), "%s / %s",
+                     yadua::HumanSize(read).c_str(), yadua::HumanSize(total).c_str());
+        }
+        ImGui::ProgressBar(frac, ImVec2(ImGui::GetFontSize() * 25.0f, 0.0f),
+                           overlay[0] ? overlay : nullptr);
     } else if (!app.Error.empty()) {
         ImGui::NewLine();
         ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "Scan failed: %s",
@@ -812,7 +829,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
     ImGui_ImplDX11_Init(g_d3dDevice, g_d3dContext);
 
     App app;
-    ListNtfsDrives(app);
+    ListFixedDrives(app);
     app.AutoScan    = cmdLine && wcsstr(cmdLine, L"--autoscan") != nullptr;
     app.OpenTreemap = cmdLine && wcsstr(cmdLine, L"--view treemap") != nullptr;
 

@@ -55,6 +55,14 @@ Launch `yadua-gui.exe` (it requests elevation itself), pick a drive, hit Scan.
   Delete to Recycle Bin (with confirmation; the view updates in place,
   no rescan needed).
 
+## Scan modes
+
+NTFS volumes scanned from an elevated process use the fast raw-MFT path.
+Anything else — non-admin runs, FAT32/exFAT/ReFS volumes — automatically
+falls back to a multi-threaded directory walk: slower (minutes instead of
+seconds on a big volume, and locked directories are skipped), but it works
+everywhere.
+
 ## CLI (run from an elevated prompt)
 
 ```powershell

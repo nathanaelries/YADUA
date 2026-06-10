@@ -28,12 +28,14 @@
       flagged in scan stats, "[link]" suffix in the tree, treemap tooltip
       note (their content never double-counts: children parent to the
       target directory in the MFT, not the link)
-- [ ] Optional: count alternate data streams (named $DATA), excluding
-      $BadClus:$Bad
-- [ ] Optional: include directory index ($INDEX_ALLOCATION) sizes so
-      "size on disk" matches Explorer more closely
-- [ ] Fallback scan path (recursive `FindFirstFileExW`) for non-NTFS volumes
-      (FAT32/exFAT/ReFS) and non-admin runs
+- [x] Count alternate data streams (named $DATA); sparse ADS excluded from
+      logical size so $BadClus:$Bad can't inflate totals
+- [x] Include directory index ($INDEX_ALLOCATION) clusters in "size on
+      disk", seeded into each directory's own cumulative total
+- [x] Fallback scan path: multi-threaded `FindFirstFileExW` walk for
+      non-NTFS volumes (FAT32/exFAT/ReFS) and non-admin runs; selected
+      automatically by `ScanVolumeAuto`, skips reparse dirs to avoid
+      junction cycles, approximates allocated sizes by cluster rounding
 
 ## Phase 2 — Interactive UI
 

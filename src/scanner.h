@@ -64,9 +64,10 @@ struct ScanStats {
     uint32_t ClusterSize   = 0;
     uint32_t RecordSize    = 0;
     uint64_t MftBytes      = 0;
-    double   StreamSeconds = 0; // MFT read+parse
+    double   StreamSeconds = 0; // MFT read+parse (or directory walk)
     double   TotalSeconds  = 0; // including aggregation and indexing
     unsigned Threads       = 0;
+    bool     UsedFallback  = false; // directory walk instead of raw MFT
 };
 
 // Live progress for UIs; safe to poll from another thread.
@@ -84,6 +85,7 @@ struct ScanResult {
     std::vector<DirTotals> Totals;    // indexed like Nodes
     ChildIndex             Children;
     ScanStats              Stats;
+    std::wstring           FallbackReason; // why the MFT path was unavailable
     uint64_t               FileCount = 0;
     uint64_t               DirCount  = 0;
 
@@ -102,11 +104,27 @@ struct ScanResult {
     std::wstring Path(uint32_t i) const; // full path, rooted at Drive
 };
 
-// Scans an NTFS volume ("C:", "D:", ...) and fills `out` (nodes, cumulative
-// totals, sorted child index). `threads` = 0 picks a sensible default.
-// Returns false and sets `error` on failure. `progress` may be null.
+// Scans an NTFS volume ("C:", "D:", ...) via raw MFT reads and fills `out`
+// (nodes, cumulative totals, sorted child index). `threads` = 0 picks a
+// sensible default. Returns false and sets `error` on failure (no admin
+// rights, not NTFS, ...). `progress` may be null.
 bool ScanVolume(const std::wstring& drive, unsigned threads, ScanResult& out,
                 std::wstring& error, ScanProgress* progress = nullptr);
+
+// Slower fallback: a multi-threaded FindFirstFileExW directory walk. Works
+// on any filesystem and without Administrator rights (inaccessible
+// directories are skipped). Allocated sizes are approximated by rounding up
+// to whole clusters. Progress reports entries found via BytesRead with
+// TotalBytes left at 0 (the total is unknown up front).
+bool ScanVolumeFallback(const std::wstring& drive, unsigned threads,
+                        ScanResult& out, std::wstring& error,
+                        ScanProgress* progress = nullptr);
+
+// Tries the raw-MFT scan first and silently falls back to the directory
+// walk; Stats.UsedFallback / FallbackReason say what happened.
+bool ScanVolumeAuto(const std::wstring& drive, unsigned threads,
+                    ScanResult& out, std::wstring& error,
+                    ScanProgress* progress = nullptr);
 
 // Formatting helpers shared by the frontends.
 std::string  Utf8(const std::wstring& w);

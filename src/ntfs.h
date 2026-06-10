@@ -34,10 +34,24 @@ constexpr uint16_t kRecordInUse       = 0x0001;
 constexpr uint16_t kRecordIsDirectory = 0x0002;
 
 // Attribute type codes we care about.
-constexpr uint32_t kAttrAttributeList = 0x20;
-constexpr uint32_t kAttrFileName      = 0x30;
-constexpr uint32_t kAttrData          = 0x80;
-constexpr uint32_t kAttrEnd           = 0xFFFFFFFF;
+constexpr uint32_t kAttrAttributeList   = 0x20;
+constexpr uint32_t kAttrFileName        = 0x30;
+constexpr uint32_t kAttrData            = 0x80;
+constexpr uint32_t kAttrIndexAllocation = 0xA0; // directory index ($I30) clusters
+constexpr uint32_t kAttrEnd             = 0xFFFFFFFF;
+
+// AttributeHeader::Flags bits.
+constexpr uint16_t kAttrFlagCompressed = 0x0001;
+constexpr uint16_t kAttrFlagSparse     = 0x8000;
+
+// Records 0-15 are the classic NTFS metafiles ($MFT, $BadClus, $Secure, ...).
+constexpr uint64_t kFirstUserRecord = 16;
+
+// For sparse/compressed non-resident attributes, NonResidentAttribute ends
+// with an extra uint64 at offset 0x40 (TotalAllocated): the clusters actually
+// backed by disk. The regular AllocatedSize field then only describes the
+// reserved VCN span (e.g. the whole volume for $BadClus:$Bad).
+constexpr uint32_t kTotalAllocatedOffset = 0x40;
 
 // FILE_ATTRIBUTE_REPARSE_POINT as mirrored into $FILE_NAME's FileAttributes.
 constexpr uint32_t kFileAttrReparsePoint = 0x00000400;

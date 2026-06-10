@@ -178,12 +178,14 @@ static bool ScanWithProgress(const std::wstring& drive, unsigned threads,
                     fprintf(stderr, "\rReading MFT... %5.1f%% (%s / %s)   ",
                             100.0 * (double)read / (double)total,
                             HumanSize(read).c_str(), HumanSize(total).c_str());
+                else if (read) // directory-walk fallback: total is unknown
+                    fprintf(stderr, "\rScanning... %llu entries found   ", read);
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
             fprintf(stderr, "\r%*s\r", 60, ""); // wipe the progress line
         });
     }
-    bool ok = ScanVolume(drive, threads, r, error, &progress);
+    bool ok = ScanVolumeAuto(drive, threads, r, error, &progress);
     finished = true;
     if (ticker.joinable()) ticker.join();
     return ok;
@@ -245,21 +247,33 @@ int wmain(int argc, wchar_t** argv) {
 
     ScanResult r;
     std::wstring error;
+    // Note: never printf("%ls") — the C-locale wide conversion silently
+    // truncates output at the first non-ASCII character. Console output is
+    // UTF-8 (SetConsoleOutputCP), so always go through Utf8().
     if (!ScanWithProgress(drives[d], threads, r, error)) {
-        fprintf(stderr, "error: %ls\n", error.c_str());
+        fprintf(stderr, "error: %s\n", Utf8(error).c_str());
         ++failures;
         continue;
     }
 
-    printf("Volume %ls: cluster %u B, MFT record %u B, MFT size %s "
-           "(%llu records), %u parser threads\n",
-           r.Drive.c_str(), r.Stats.ClusterSize, r.Stats.RecordSize,
-           HumanSize(r.Stats.MftBytes).c_str(), r.Stats.RecordsParsed,
-           r.Stats.Threads);
-    printf("Scanned %llu records in %.2f s (MFT streamed in %.2f s, %s @ %.0f MB/s)\n",
-           r.Stats.RecordsParsed, r.Stats.TotalSeconds, r.Stats.StreamSeconds,
-           HumanSize(r.Stats.BytesRead).c_str(),
-           r.Stats.BytesRead / r.Stats.StreamSeconds / (1024.0 * 1024.0));
+    if (r.Stats.UsedFallback) {
+        printf("Volume %s: directory-walk fallback, %u threads\n"
+               "  (raw MFT access unavailable: %s)\n",
+               Utf8(r.Drive).c_str(), r.Stats.Threads,
+               Utf8(r.FallbackReason).c_str());
+        printf("Scanned %llu entries in %.2f s\n",
+               r.Stats.RecordsParsed, r.Stats.TotalSeconds);
+    } else {
+        printf("Volume %s: cluster %u B, MFT record %u B, MFT size %s "
+               "(%llu records), %u parser threads\n",
+               Utf8(r.Drive).c_str(), r.Stats.ClusterSize, r.Stats.RecordSize,
+               HumanSize(r.Stats.MftBytes).c_str(), r.Stats.RecordsParsed,
+               r.Stats.Threads);
+        printf("Scanned %llu records in %.2f s (MFT streamed in %.2f s, %s @ %.0f MB/s)\n",
+               r.Stats.RecordsParsed, r.Stats.TotalSeconds, r.Stats.StreamSeconds,
+               HumanSize(r.Stats.BytesRead).c_str(),
+               r.Stats.BytesRead / r.Stats.StreamSeconds / (1024.0 * 1024.0));
+    }
 
     const DirTotals& root = r.Totals[kRootRecord];
     printf("Files: %llu   Folders: %llu   Total size: %s   On disk: %s\n",
@@ -305,7 +319,7 @@ int wmain(int argc, wchar_t** argv) {
     auto openOut = [](const std::wstring& path) {
         FILE* f = _wfopen(path.c_str(), L"wb");
         if (f) setvbuf(f, nullptr, _IOFBF, 1 << 20); // big buffer: millions of rows
-        else fprintf(stderr, "error: cannot write %ls\n", path.c_str());
+        else fprintf(stderr, "error: cannot write %s\n", Utf8(path).c_str());
         return f;
     };
     if (!csvPath.empty()) {
@@ -313,7 +327,7 @@ int wmain(int argc, wchar_t** argv) {
         if (FILE* f = openOut(path)) {
             ExportCsv(f, r, top, exportAll);
             fclose(f);
-            printf("\nCSV written to %ls\n", path.c_str());
+            printf("\nCSV written to %s\n", Utf8(path).c_str());
         } else return 1;
     }
     if (!jsonPath.empty()) {
@@ -321,7 +335,7 @@ int wmain(int argc, wchar_t** argv) {
         if (FILE* f = openOut(path)) {
             ExportJson(f, r, top, exportAll);
             fclose(f);
-            printf("JSON written to %ls\n", path.c_str());
+            printf("JSON written to %s\n", Utf8(path).c_str());
         } else return 1;
     }
 
