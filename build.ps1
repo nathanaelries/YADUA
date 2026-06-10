@@ -3,7 +3,11 @@ param(
     # Target architecture: x64 (default) or arm64 (cross-compiled from an
     # x64 host). 'amd64' is accepted as an alias for x64 (CI convention).
     [ValidateSet('x64', 'amd64', 'arm64')]
-    [string]$Arch = 'x64'
+    [string]$Arch = 'x64',
+
+    # Semantic version stamped into the VERSIONINFO resource (CI passes the
+    # tag without the leading 'v'). Local builds default to 0.0.0.
+    [string]$Version = '0.0.0'
 )
 $ErrorActionPreference = 'Stop'
 
@@ -22,12 +26,20 @@ New-Item -ItemType Directory -Force $obj | Out-Null
 
 $common = '/nologo /O2 /std:c++20 /EHsc /D_CRT_SECURE_NO_WARNINGS'
 
-# App icon resource, linked into both executables.
-$res = "rc /nologo /fo `"$obj\yadua.res`" `"$root\assets\yadua.rc`""
+# Generate version.h for the VERSIONINFO resource (see assets/yadua.rc).
+$verNumeric = ($Version.Split('-')[0].Split('.') + @('0', '0', '0'))[0..2]
+@"
+#define YADUA_VER_NUM $($verNumeric -join ','),0
+#define YADUA_VER_STR "$Version"
+"@ | Set-Content "$obj\version.h" -Encoding ascii
+
+# Icon + version resources; OriginalFilename/description differ per binary.
+$res = "rc /nologo /i `"$obj`" /fo `"$obj\yadua-cli.res`" `"$root\assets\yadua.rc`"" +
+       " && rc /nologo /i `"$obj`" /d YADUA_IS_GUI /fo `"$obj\yadua-gui.res`" `"$root\assets\yadua.rc`""
 
 # CLI: our code only, warnings cranked up.
 $cli = "cl $common /W4 `"$root\src\cli.cpp`" `"$root\src\scanner.cpp`"" +
-       " `"$obj\yadua.res`" /Fe:`"$root\yadua.exe`" /Fo:`"$obj`"\\"
+       " `"$obj\yadua-cli.res`" /Fe:`"$root\yadua.exe`" /Fo:`"$obj`"\\"
 
 # GUI: /W3 because the vendored imgui sources are not /W4-clean.
 # The manifest requests Administrator elevation (raw volume access).
@@ -38,7 +50,7 @@ $guiSrc = @(
     "$imgui\backends\imgui_impl_win32.cpp", "$imgui\backends\imgui_impl_dx11.cpp"
 ) | ForEach-Object { "`"$_`"" }
 $gui = "cl $common /W3 /DUNICODE /D_UNICODE /I`"$imgui`" /I`"$imgui\backends`" $($guiSrc -join ' ')" +
-       " `"$obj\yadua.res`" /Fe:`"$root\yadua-gui.exe`" /Fo:`"$obj`"\\" +
+       " `"$obj\yadua-gui.res`" /Fe:`"$root\yadua-gui.exe`" /Fo:`"$obj`"\\" +
        " /link /SUBSYSTEM:WINDOWS" +
        " `"/MANIFESTUAC:level='requireAdministrator' uiAccess='false'`"" +
        " d3d11.lib d3dcompiler.lib dxgi.lib user32.lib gdi32.lib shell32.lib ole32.lib"

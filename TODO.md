@@ -59,4 +59,9 @@
 - [ ] Export/import scan snapshots; diff two scans over time
 - [x] x64 + ARM64 release builds, CI via GitHub Actions (tag-triggered
       release workflow with checksums + generated notes)
+- [x] Installer (Inno Setup: GUI + CLI, shortcuts, optional PATH) and
+      portable ZIPs per architecture
+- [x] VERSIONINFO resource stamped from the release tag
+- [ ] Code signing (Azure Trusted Signing or similar) to stop antivirus /
+      SmartScreen false positives on the unsigned binaries
 - [ ] Benchmark suite vs. WizTree / WinDirStat / TreeSize

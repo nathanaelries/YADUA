@@ -12,9 +12,23 @@ thread streams the MFT while a pool of worker threads parses the records.
 
 ## Download
 
-Prebuilt Windows binaries (amd64 + arm64, GUI and CLI) are published on the
-[Releases page](https://github.com/nathanaelries/YADUA/releases) for every
-version tag, with SHA-256 checksums.
+Every version tag publishes to the
+[Releases page](https://github.com/nathanaelries/YADUA/releases)
+(amd64 + arm64, SHA-256 checksums for everything):
+
+- **Installer** (`YADUA-setup-*.exe`) — installs GUI + CLI with Start Menu
+  shortcut, optional desktop icon, optional CLI on PATH, and an uninstaller.
+- **Portable** (`YADUA-*-portable.zip`) — both executables, run from
+  anywhere, no installation and no traces outside the folder.
+- Bare `.exe` files for scripting/automation.
+
+> **Antivirus note:** the binaries are currently unsigned, and an unsigned,
+> freshly-released tool that requests elevation and reads raw NTFS volumes is
+> exactly the profile SmartScreen/Defender heuristics distrust, so false
+> positives can happen. The exes carry full version metadata and you can
+> verify downloads against `SHA256SUMS.txt`. If Defender flags a download,
+> you can report the false positive to Microsoft (Security Intelligence →
+> file submission). Code signing is on the roadmap.
 
 ## Build
 

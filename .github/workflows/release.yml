@@ -9,11 +9,13 @@
 # amd64_arm64 toolchain, which the hosted runner image includes).
 #
 # Produced release assets (per tag, e.g. v1.2.3):
-#   YADUA-v1.2.3-windows-amd64.exe       GUI app
-#   YADUA-v1.2.3-windows-arm64.exe
-#   YADUA-cli-v1.2.3-windows-amd64.exe   console scanner / CSV+JSON export
-#   YADUA-cli-v1.2.3-windows-arm64.exe
-#   SHA256SUMS.txt                       checksums for all of the above
+#   YADUA-setup-v1.2.3-windows-{amd64,arm64}.exe    installer (GUI + CLI,
+#                                                   shortcuts, optional PATH)
+#   YADUA-v1.2.3-windows-{amd64,arm64}-portable.zip portable: both exes,
+#                                                   no install needed
+#   YADUA-v1.2.3-windows-{amd64,arm64}.exe          bare GUI executable
+#   YADUA-cli-v1.2.3-windows-{amd64,arm64}.exe      bare CLI executable
+#   SHA256SUMS.txt                                  checksums for all assets
 # ============================================================================
 name: Release
 
@@ -47,10 +49,13 @@ jobs:
         uses: actions/checkout@v5
 
       # build.ps1 locates MSVC via vswhere and runs vcvarsall for the target
-      # arch, then compiles the CLI, the Dear ImGui GUI, and the icon resource.
+      # arch, then compiles the CLI, the Dear ImGui GUI, and the icon/version
+      # resources. The tag (minus 'v') is stamped into VERSIONINFO - proper
+      # version metadata also reduces antivirus false positives on unsigned
+      # binaries.
       - name: Build (MSVC, ${{ matrix.arch }})
         shell: pwsh
-        run: ./build.ps1 -Arch ${{ matrix.arch }}
+        run: ./build.ps1 -Arch ${{ matrix.arch }} -Version ('${{ github.ref_name }}'.TrimStart('v'))
 
       # The amd64 binaries can run on the amd64 runner; make sure the CLI at
       # least starts and prints usage before we ship it. (arm64 can't execute
@@ -62,15 +67,22 @@ jobs:
           ./yadua.exe --help
           if ($LASTEXITCODE -ne 0) { throw "CLI smoke test failed" }
 
-      # Rename to the clean, consistent release filenames.
+      # Bare exes (clean names), a portable zip, and the Inno Setup installer.
+      # Inno Setup 6 is preinstalled on the hosted Windows runner image.
       - name: Stage release assets
         shell: pwsh
         run: |
           $tag  = '${{ github.ref_name }}'
+          $ver  = $tag.TrimStart('v')
           $arch = '${{ matrix.arch }}'
           New-Item -ItemType Directory dist | Out-Null
           Copy-Item yadua-gui.exe "dist/YADUA-$tag-windows-$arch.exe"
           Copy-Item yadua.exe     "dist/YADUA-cli-$tag-windows-$arch.exe"
+          Compress-Archive -Path yadua-gui.exe, yadua.exe, LICENSE, README.md `
+              -DestinationPath "dist/YADUA-$tag-windows-$arch-portable.zip"
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Qp `
+              "/DAppVersion=$ver" "/DArch=$arch" "/DSrcDir=$PWD" installer\yadua.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
           Get-ChildItem dist
 
       - name: Upload build artifacts
