@@ -13,17 +13,21 @@
       a nested `tree` object with children sorted by size)
 - [x] Multi-threaded record parsing (reader thread streams the MFT while a
       worker pool parses; scan is now bounded by raw volume read speed)
-- [ ] Scan multiple/all fixed volumes in one run
-- [ ] Progress reporting during the read (percent of MFT streamed)
+- [x] Scan multiple volumes in one run (`yadua.exe C: D:`, exports get a
+      per-drive suffix)
+- [x] Progress reporting during the read (live percent on stderr when
+      attached to a console; silent when output is redirected)
 
 ### Parser correctness gaps
 
-- [ ] Parse `$ATTRIBUTE_LIST` so a heavily fragmented $MFT (run list overflowing
-      into extension records) scans instead of bailing with an error
-- [ ] Surface orphaned subtrees in a visible "lost+found" bucket instead of
-      silently dropping their contribution
-- [ ] Mark reparse points (junctions, symlinks, OneDrive placeholders) and
-      exclude/flag them in totals
+- [x] Parse `$ATTRIBUTE_LIST` so a heavily fragmented $MFT (run list
+      overflowing into extension records) scans instead of bailing
+- [x] Surface orphaned subtrees in a visible `[orphaned]` bucket at the
+      volume root instead of silently dropping their contribution
+- [x] Mark reparse points (junctions, symlinks, OneDrive placeholders):
+      flagged in scan stats, "[link]" suffix in the tree, treemap tooltip
+      note (their content never double-counts: children parent to the
+      target directory in the MFT, not the link)
 - [ ] Optional: count alternate data streams (named $DATA), excluding
       $BadClus:$Bad
 - [ ] Optional: include directory index ($INDEX_ALLOCATION) sizes so

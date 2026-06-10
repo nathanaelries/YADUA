@@ -249,6 +249,8 @@ void ParseRecord(uint8_t* rec, uint32_t recordSize, uint64_t recordIndex,
                 if (rank < node->NameRank &&
                     res->ValueOffset + sizeof(FileNameAttribute) + nameBytes
                         <= attr->Length) {
+                    if (fn->FileAttributes & kFileAttrReparsePoint)
+                        node->Flags |= kNodeReparse;
                     node->NameRank   = rank;
                     node->Parent     = static_cast<uint32_t>(
                         fn->ParentRef & 0x0000FFFFFFFFFFFFull);
@@ -480,7 +482,7 @@ void MergeContexts(std::vector<ParseContext>& contexts, ScanResult& result) {
 }
 
 // ============================================================================
-// Aggregation
+// Orphan handling
 // ============================================================================
 
 bool IsValidParent(const std::vector<Node>& nodes, uint32_t parent,
@@ -491,6 +493,42 @@ bool IsValidParent(const std::vector<Node>& nodes, uint32_t parent,
     // and its MFT slot reused for something else, the sequence won't match.
     return (p.Flags & kNodeInUse) && (p.Flags & kNodeIsDir) &&
            p.Sequence == expectedSeq;
+}
+
+// Reparent every node with a broken parent link (deleted/reused parent slot,
+// corrupt reference, self-reference) under a synthetic "[orphaned]" directory
+// at the volume root, so orphaned subtrees stay visible instead of silently
+// dropping out of the totals. Also counts reparse points while it has the
+// nodes in cache.
+void CollectOrphans(ScanResult& r) {
+    const size_t realCount = r.Nodes.size(); // bucket appended past this
+    uint32_t bucket = UINT32_MAX;
+
+    for (size_t i = 0; i < realCount; ++i) {
+        Node& n = r.Nodes[i];
+        if (!(n.Flags & kNodeInUse) || !(n.Flags & kNodeNamed)) continue;
+        if (n.Flags & kNodeReparse) ++r.Stats.ReparseCount;
+        if (i == kRootRecord) continue;
+        if (n.Parent != i && IsValidParent(r.Nodes, n.Parent, n.ParentSeq))
+            continue;
+
+        if (bucket == UINT32_MAX) {
+            Node b;
+            b.Flags      = kNodeInUse | kNodeIsDir | kNodeNamed;
+            b.Sequence   = 1;
+            b.Parent     = (uint32_t)kRootRecord;
+            b.ParentSeq  = r.Nodes[kRootRecord].Sequence;
+            b.NameOffset = (uint32_t)r.NameArena.size();
+            const wchar_t* name = L"[orphaned]";
+            b.NameLength = 10;
+            r.NameArena.insert(r.NameArena.end(), name, name + b.NameLength);
+            r.Nodes.push_back(b);
+            bucket = (uint32_t)(r.Nodes.size() - 1);
+        }
+        n.Parent    = bucket;
+        n.ParentSeq = 1; // matches the bucket's Sequence
+        ++r.Stats.OrphanCount;
+    }
 }
 
 // For every file/dir, walk the parent chain to the root, adding its size and
@@ -548,6 +586,148 @@ void BuildChildIndex(ScanResult& r) {
         std::sort(r.Children.List.begin() + r.Children.Offset[i],
                   r.Children.List.begin() + r.Children.Offset[i + 1],
                   [&](uint32_t a, uint32_t b) { return r.SizeOf(a) > r.SizeOf(b); });
+}
+
+// ============================================================================
+// $ATTRIBUTE_LIST handling for a heavily fragmented $MFT
+//
+// When the $MFT's own run list grows past what fits in record 0, NTFS moves
+// later portions of the $DATA attribute into extension records and leaves a
+// $ATTRIBUTE_LIST in record 0 describing where each portion lives. The
+// extension records themselves sit in the early part of the MFT, which the
+// base run list already maps, so we can resolve and read them.
+// ============================================================================
+
+// Maps a byte offset inside the $MFT data stream to a disk offset using the
+// (possibly partial) run list collected so far.
+bool ResolveStreamOffset(const std::vector<Extent>& runs, uint32_t clusterSize,
+                         uint64_t streamOffset, uint64_t& diskOffset) {
+    uint64_t vcn = streamOffset / clusterSize;
+    uint64_t rem = streamOffset % clusterSize;
+    for (const Extent& r : runs)
+        if (r.Lcn >= 0 && vcn >= r.Vcn && vcn < r.Vcn + r.Clusters) {
+            diskOffset = (uint64_t)(r.Lcn + (vcn - r.Vcn)) * clusterSize + rem;
+            return true;
+        }
+    return false;
+}
+
+// Reads one MFT record by number via the partial run map (cluster-aligned
+// read, fixups applied). Returns nullptr-equivalent via `false`.
+bool ReadMftRecord(HANDLE volume, const std::vector<Extent>& runs,
+                   uint32_t clusterSize, uint32_t recordSize,
+                   uint64_t recordNumber, std::vector<uint8_t>& out) {
+    uint64_t diskOffset = 0;
+    if (!ResolveStreamOffset(runs, clusterSize, recordNumber * (uint64_t)recordSize,
+                             diskOffset))
+        return false;
+    uint64_t alignedStart = diskOffset - diskOffset % clusterSize;
+    uint32_t readLen = (uint32_t)(((diskOffset - alignedStart + recordSize +
+                                    clusterSize - 1) / clusterSize) * clusterSize);
+    std::vector<uint8_t> buf(readLen);
+    if (!ReadAt(volume, alignedStart, buf.data(), readLen)) return false;
+    out.assign(buf.begin() + (diskOffset - alignedStart),
+               buf.begin() + (diskOffset - alignedStart) + recordSize);
+    auto* hdr = reinterpret_cast<FileRecordHeader*>(out.data());
+    return hdr->Magic == kFileRecordMagic && ApplyFixups(out.data(), recordSize);
+}
+
+// Extends `runs` with the $DATA portions held in extension records named by
+// record 0's $ATTRIBUTE_LIST. Returns false (with `error`) if anything along
+// the way is unreadable — the caller then reports the coverage shortfall.
+bool ExtendRunsFromAttributeList(HANDLE volume, const uint8_t* rec0,
+                                 uint32_t recordSize, uint32_t clusterSize,
+                                 std::vector<Extent>& runs, std::wstring& error) {
+    auto* hdr = reinterpret_cast<const FileRecordHeader*>(rec0);
+    uint32_t limit  = std::min(hdr->UsedSize, recordSize);
+    uint32_t offset = hdr->FirstAttributeOffset;
+
+    // 1. Find $ATTRIBUTE_LIST and materialize its value bytes.
+    std::vector<uint8_t> list;
+    while (offset + sizeof(AttributeHeader) <= limit) {
+        auto* attr = reinterpret_cast<const AttributeHeader*>(rec0 + offset);
+        if (attr->Type == kAttrEnd || attr->Length == 0) break;
+        if (attr->Type == kAttrAttributeList) {
+            if (!attr->NonResident) {
+                auto* res = reinterpret_cast<const ResidentAttribute*>(attr);
+                if (res->ValueOffset + res->ValueLength <= attr->Length)
+                    list.assign(rec0 + offset + res->ValueOffset,
+                                rec0 + offset + res->ValueOffset + res->ValueLength);
+            } else {
+                // The list itself is non-resident: read its clusters.
+                auto* nr = reinterpret_cast<const NonResidentAttribute*>(attr);
+                auto listRuns = DecodeRunList(rec0 + offset + nr->RunListOffset,
+                                              rec0 + offset + attr->Length,
+                                              nr->LowestVcn);
+                uint64_t want = nr->RealSize;
+                for (const Extent& r : listRuns) {
+                    if (r.Lcn < 0 || list.size() >= want) continue;
+                    uint64_t bytes = std::min(r.Clusters * (uint64_t)clusterSize,
+                                              want - list.size());
+                    uint64_t readLen = (bytes + clusterSize - 1) / clusterSize *
+                                       (uint64_t)clusterSize;
+                    std::vector<uint8_t> chunk((size_t)readLen);
+                    if (!ReadAt(volume, (uint64_t)r.Lcn * clusterSize,
+                                chunk.data(), (uint32_t)readLen)) {
+                        error = L"cannot read the non-resident $ATTRIBUTE_LIST";
+                        return false;
+                    }
+                    list.insert(list.end(), chunk.begin(),
+                                chunk.begin() + (size_t)bytes);
+                }
+            }
+            break;
+        }
+        offset += attr->Length;
+    }
+    if (list.empty()) {
+        error = L"$MFT run list is incomplete and record 0 has no readable "
+                L"$ATTRIBUTE_LIST";
+        return false;
+    }
+
+    // 2. Collect the extension records that hold $DATA portions.
+    std::vector<uint64_t> extensionRecords;
+    for (size_t pos = 0; pos + sizeof(AttributeListEntry) <= list.size(); ) {
+        auto* entry = reinterpret_cast<const AttributeListEntry*>(list.data() + pos);
+        if (entry->Length < sizeof(AttributeListEntry)) break;
+        if (entry->Type == kAttrData && entry->NameLength == 0) {
+            uint64_t recno = entry->FileRef & 0x0000FFFFFFFFFFFFull;
+            if (recno != 0 && // record 0's own portion is already decoded
+                std::find(extensionRecords.begin(), extensionRecords.end(),
+                          recno) == extensionRecords.end())
+                extensionRecords.push_back(recno);
+        }
+        pos += entry->Length;
+    }
+
+    // 3. Read each extension record and append its $DATA run-list portion.
+    for (uint64_t recno : extensionRecords) {
+        std::vector<uint8_t> rec;
+        if (!ReadMftRecord(volume, runs, clusterSize, recordSize, recno, rec)) {
+            error = Format(L"cannot read $MFT extension record %llu", recno);
+            return false;
+        }
+        auto* ehdr = reinterpret_cast<FileRecordHeader*>(rec.data());
+        uint32_t elimit  = std::min(ehdr->UsedSize, recordSize);
+        uint32_t eoffset = ehdr->FirstAttributeOffset;
+        while (eoffset + sizeof(AttributeHeader) <= elimit) {
+            auto* attr = reinterpret_cast<AttributeHeader*>(rec.data() + eoffset);
+            if (attr->Type == kAttrEnd || attr->Length == 0) break;
+            if (attr->Type == kAttrData && attr->NameLength == 0 &&
+                attr->NonResident) {
+                auto* nr = reinterpret_cast<NonResidentAttribute*>(attr);
+                auto more = DecodeRunList(rec.data() + eoffset + nr->RunListOffset,
+                                          rec.data() + eoffset + attr->Length,
+                                          nr->LowestVcn);
+                runs.insert(runs.end(), more.begin(), more.end());
+            }
+            eoffset += attr->Length;
+        }
+    }
+    std::sort(runs.begin(), runs.end(),
+              [](const Extent& a, const Extent& b) { return a.Vcn < b.Vcn; });
+    return true;
 }
 
 } // namespace
@@ -651,11 +831,21 @@ bool ScanVolume(const std::wstring& driveIn, unsigned threads, ScanResult& out,
         return false;
     }
     {
-        uint64_t mapped = 0;
-        for (auto& r : mftRuns) mapped += r.Clusters;
-        if (mapped * clusterSize < mftBytes) {
-            error = L"the $MFT run list continues in an extension record "
-                    L"($ATTRIBUTE_LIST overflow — not handled yet)";
+        auto mappedBytes = [&] {
+            uint64_t clusters = 0;
+            for (auto& r : mftRuns) clusters += r.Clusters;
+            return clusters * clusterSize;
+        };
+        // A heavily fragmented $MFT spills later run-list portions into
+        // extension records via $ATTRIBUTE_LIST; stitch them in.
+        if (mappedBytes() < mftBytes &&
+            !ExtendRunsFromAttributeList(volume, rec0.data(), recordSize,
+                                         clusterSize, mftRuns, error))
+            return false;
+        if (mappedBytes() < mftBytes) {
+            error = Format(L"$MFT run list covers only %llu of %llu bytes even "
+                           L"after $ATTRIBUTE_LIST processing",
+                           mappedBytes(), mftBytes);
             return false;
         }
     }
@@ -675,7 +865,8 @@ bool ScanVolume(const std::wstring& driveIn, unsigned threads, ScanResult& out,
     if (progress)
         progress->Stage.store(ScanProgress::Aggregating, std::memory_order_relaxed);
 
-    // ---- 6. Aggregate folder sizes and build the child index --------------
+    // ---- 6. Reparent orphans, aggregate sizes, build the child index ------
+    CollectOrphans(out);
     Aggregate(out);
     BuildChildIndex(out);
 

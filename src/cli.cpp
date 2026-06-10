@@ -6,11 +6,15 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <io.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <functional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "scanner.h"
@@ -153,13 +157,59 @@ static void ExportJson(FILE* f, const ScanResult& r, const TopLists& top,
 }
 
 // ============================================================================
+// Scan with a live progress line (only when stderr is an interactive console;
+// redirected output stays clean).
+// ============================================================================
+
+static bool ScanWithProgress(const std::wstring& drive, unsigned threads,
+                             ScanResult& r, std::wstring& error) {
+    ScanProgress progress;
+    std::atomic<bool> finished{false};
+    std::thread ticker;
+    if (_isatty(_fileno(stderr))) {
+        ticker = std::thread([&] {
+            while (!finished) {
+                uint64_t total = progress.TotalBytes.load(std::memory_order_relaxed);
+                uint64_t read  = progress.BytesRead.load(std::memory_order_relaxed);
+                int stage = progress.Stage.load(std::memory_order_relaxed);
+                if (stage >= ScanProgress::Aggregating)
+                    fprintf(stderr, "\rBuilding tree...                         ");
+                else if (total)
+                    fprintf(stderr, "\rReading MFT... %5.1f%% (%s / %s)   ",
+                            100.0 * (double)read / (double)total,
+                            HumanSize(read).c_str(), HumanSize(total).c_str());
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            fprintf(stderr, "\r%*s\r", 60, ""); // wipe the progress line
+        });
+    }
+    bool ok = ScanVolume(drive, threads, r, error, &progress);
+    finished = true;
+    if (ticker.joinable()) ticker.join();
+    return ok;
+}
+
+// Inserts a drive suffix before the extension when exporting several volumes
+// in one run: results.csv -> results_C.csv
+static std::wstring SuffixedPath(const std::wstring& path, const ScanResult& r,
+                                 bool multi) {
+    if (!multi) return path;
+    std::wstring suffix = L"_";
+    suffix += r.Drive[0];
+    size_t dot = path.find_last_of(L'.');
+    if (dot == std::wstring::npos || dot < path.find_last_of(L"\\/") + 1)
+        return path + suffix;
+    return path.substr(0, dot) + suffix + path.substr(dot);
+}
+
+// ============================================================================
 // main
 // ============================================================================
 
 int wmain(int argc, wchar_t** argv) {
     SetConsoleOutputCP(CP_UTF8);
 
-    std::wstring drive = L"C:";
+    std::vector<std::wstring> drives;
     int topN = 50;
     bool exportAll = false;
     std::wstring csvPath, jsonPath;
@@ -172,10 +222,10 @@ int wmain(int argc, wchar_t** argv) {
         else if (arg == L"--threads" && i + 1 < argc) threads = _wtoi(argv[++i]);
         else if (arg == L"--all")                     exportAll = true;
         else if (arg == L"--help" || arg == L"-h") {
-            printf("Usage: yadua.exe [drive] [options]\n"
-                   "  drive        volume to scan, e.g. C: (default C:)\n"
+            printf("Usage: yadua.exe [drives...] [options]\n"
+                   "  drives       volumes to scan, e.g. C: D: (default C:)\n"
                    "  --top N      how many entries per list (default 50)\n"
-                   "  --csv FILE   export to CSV\n"
+                   "  --csv FILE   export to CSV (multiple drives: FILE_C.csv...)\n"
                    "  --json FILE  export to JSON\n"
                    "  --all        export the entire tree, not just the top-N\n"
                    "               lists (CSV: one row per file/folder; JSON:\n"
@@ -184,14 +234,21 @@ int wmain(int argc, wchar_t** argv) {
                    "Must be run from an elevated (Administrator) prompt.\n");
             return 0;
         }
-        else if (!arg.empty() && arg[0] != L'-') drive = arg;
+        else if (!arg.empty() && arg[0] != L'-') drives.push_back(arg);
     }
+    if (drives.empty()) drives.push_back(L"C:");
+    const bool multi = drives.size() > 1;
+
+    int failures = 0;
+    for (size_t d = 0; d < drives.size(); ++d) {
+    if (d) printf("\n%s\n\n", std::string(72, '=').c_str());
 
     ScanResult r;
     std::wstring error;
-    if (!ScanVolume(drive, threads, r, error)) {
+    if (!ScanWithProgress(drives[d], threads, r, error)) {
         fprintf(stderr, "error: %ls\n", error.c_str());
-        return 1;
+        ++failures;
+        continue;
     }
 
     printf("Volume %ls: cluster %u B, MFT record %u B, MFT size %s "
@@ -209,6 +266,10 @@ int wmain(int argc, wchar_t** argv) {
            r.FileCount, r.DirCount,
            HumanSize(root.LogicalSize).c_str(),
            HumanSize(root.AllocatedSize).c_str());
+    if (r.Stats.ReparseCount || r.Stats.OrphanCount)
+        printf("Reparse points (junctions/links): %llu   Orphaned entries: %llu%s\n",
+               r.Stats.ReparseCount, r.Stats.OrphanCount,
+               r.Stats.OrphanCount ? "  (see [orphaned] at the root)" : "");
 
     // ---- Top-N lists --------------------------------------------------------
     TopLists top;
@@ -248,19 +309,23 @@ int wmain(int argc, wchar_t** argv) {
         return f;
     };
     if (!csvPath.empty()) {
-        if (FILE* f = openOut(csvPath)) {
+        std::wstring path = SuffixedPath(csvPath, r, multi);
+        if (FILE* f = openOut(path)) {
             ExportCsv(f, r, top, exportAll);
             fclose(f);
-            printf("\nCSV written to %ls\n", csvPath.c_str());
+            printf("\nCSV written to %ls\n", path.c_str());
         } else return 1;
     }
     if (!jsonPath.empty()) {
-        if (FILE* f = openOut(jsonPath)) {
+        std::wstring path = SuffixedPath(jsonPath, r, multi);
+        if (FILE* f = openOut(path)) {
             ExportJson(f, r, top, exportAll);
             fclose(f);
-            printf("JSON written to %ls\n", jsonPath.c_str());
+            printf("JSON written to %ls\n", path.c_str());
         } else return 1;
     }
 
-    return 0;
+    } // for each drive
+
+    return failures ? 1 : 0;
 }

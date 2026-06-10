@@ -33,9 +33,10 @@ struct Node {
     uint8_t  ThreadId      = 0; // which worker's arena held the name (internal)
 };
 
-constexpr uint8_t kNodeInUse = 0x01;
-constexpr uint8_t kNodeIsDir = 0x02;
-constexpr uint8_t kNodeNamed = 0x04;
+constexpr uint8_t kNodeInUse   = 0x01;
+constexpr uint8_t kNodeIsDir   = 0x02;
+constexpr uint8_t kNodeNamed   = 0x04;
+constexpr uint8_t kNodeReparse = 0x08; // junction / symlink / placeholder
 
 constexpr uint64_t kRootRecord = 5; // the root directory "." is always record 5
 
@@ -58,6 +59,8 @@ struct ChildIndex {
 struct ScanStats {
     uint64_t BytesRead     = 0;
     uint64_t RecordsParsed = 0;
+    uint64_t ReparseCount  = 0; // junctions, symlinks, cloud placeholders
+    uint64_t OrphanCount   = 0; // nodes reparented under the [orphaned] bucket
     uint32_t ClusterSize   = 0;
     uint32_t RecordSize    = 0;
     uint64_t MftBytes      = 0;

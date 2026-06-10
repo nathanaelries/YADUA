@@ -454,6 +454,8 @@ static void DrawTree(App& app, const yadua::ScanResult& r, uint32_t idx,
         ImGui::SetNextItemOpen(true);                         // expand to reveal
 
     std::string label = isRoot ? yadua::Utf8(r.Drive) : yadua::Utf8(r.Name(idx));
+    if (r.Nodes[idx].Flags & yadua::kNodeReparse)
+        label += "  [link]"; // junction / symlink / cloud placeholder
     bool open = ImGui::TreeNodeEx((void*)(intptr_t)idx, flags, "%s", label.c_str());
     if (idx == app.RevealNode) ImGui::SetScrollHereY(0.35f);
     if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) app.SelectedNode = idx;

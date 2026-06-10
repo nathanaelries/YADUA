@@ -227,12 +227,13 @@ void TreemapView::Draw(const ScanResult& r,
                             yadua::Utf8(r.Path(it.Node)).c_str());
             } else {
                 ImGui::TextUnformatted(yadua::Utf8(r.Path(it.Node)).c_str());
-                ImGui::TextDisabled("%s%s", yadua::HumanSize(r.SizeOf(it.Node)).c_str(),
-                                    it.IsDir ? "" : "");
+                ImGui::TextDisabled("%s", yadua::HumanSize(r.SizeOf(it.Node)).c_str());
                 if (it.IsDir)
                     ImGui::TextDisabled("%llu files, %llu folders",
                                         r.Totals[it.Node].FileCount,
                                         r.Totals[it.Node].DirCount);
+                if (r.Nodes[it.Node].Flags & yadua::kNodeReparse)
+                    ImGui::TextDisabled("reparse point (junction/symlink/placeholder)");
             }
             ImGui::EndTooltip();
         }

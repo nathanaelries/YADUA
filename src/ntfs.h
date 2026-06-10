@@ -34,9 +34,13 @@ constexpr uint16_t kRecordInUse       = 0x0001;
 constexpr uint16_t kRecordIsDirectory = 0x0002;
 
 // Attribute type codes we care about.
-constexpr uint32_t kAttrFileName = 0x30;
-constexpr uint32_t kAttrData     = 0x80;
-constexpr uint32_t kAttrEnd      = 0xFFFFFFFF;
+constexpr uint32_t kAttrAttributeList = 0x20;
+constexpr uint32_t kAttrFileName      = 0x30;
+constexpr uint32_t kAttrData          = 0x80;
+constexpr uint32_t kAttrEnd           = 0xFFFFFFFF;
+
+// FILE_ATTRIBUTE_REPARSE_POINT as mirrored into $FILE_NAME's FileAttributes.
+constexpr uint32_t kFileAttrReparsePoint = 0x00000400;
 
 // Common header at the start of every attribute inside a record.
 struct AttributeHeader {
@@ -88,6 +92,21 @@ struct FileNameAttribute {
     uint8_t  NameLength;        // in WCHARs
     uint8_t  NameSpace;         // 0=POSIX 1=Win32 2=DOS(8.3) 3=Win32&DOS
     // WCHAR Name[NameLength] follows
+};
+
+// One entry in a $ATTRIBUTE_LIST value. When a file's attributes no longer
+// fit in one MFT record they spill into extension records; the attribute
+// list in the base record says which record holds which attribute (and, for
+// chopped-up non-resident attributes, which VCN range).
+struct AttributeListEntry {
+    uint32_t Type;
+    uint16_t Length;            // length of this entry, 8-byte aligned
+    uint8_t  NameLength;
+    uint8_t  NameOffset;
+    uint64_t StartVcn;          // first VCN covered by that record's portion
+    uint64_t FileRef;           // record holding the attribute (low 48 bits)
+    uint16_t AttributeId;
+    // optional WCHAR name follows
 };
 
 #pragma pack(pop)
