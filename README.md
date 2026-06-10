@@ -23,8 +23,15 @@ Produces:
 ## GUI
 
 Launch `yadua-gui.exe` (it requests elevation itself), pick a drive, hit Scan.
-Tree is sorted by size with percent-of-parent bars; type in the filter box to
-narrow by name; right-click any row to open it in Explorer or copy its path.
+
+- **Tree tab** — sortable columns (click headers), percent-of-parent bars,
+  name filter box that auto-expands to matches.
+- **Treemap tab** — WinDirStat-style squarified treemap colored by file
+  extension. Hover for details, double-click to zoom into a folder,
+  Up/Top to zoom out.
+- **Right-click** (both views) — Open in Explorer, Copy path, Properties,
+  Delete to Recycle Bin (with confirmation; the view updates in place,
+  no rescan needed).
 
 ## CLI (run from an elevated prompt)
 
@@ -44,7 +51,8 @@ Options: `--top N` (list length, default 50), `--csv FILE`, `--json FILE`,
 - `src/scanner.h/.cpp` — the scan engine (raw MFT streaming, parallel parse,
   aggregation, child index); used by both frontends
 - `src/cli.cpp` — console frontend + exports
-- `src/gui.cpp` — Dear ImGui frontend
+- `src/gui.cpp` — Dear ImGui frontend (tree view, deletion, sorting)
+- `src/treemap.h/.cpp` — squarified treemap layout + rendering
 
 ## How it works
 

@@ -1,10 +1,13 @@
 // ============================================================================
-// YADUA GUI frontend — Dear ImGui (Win32 + DirectX 11) tree view.
+// YADUA GUI frontend — Dear ImGui (Win32 + DirectX 11).
+//
+// Views: a size-sorted tree table (sortable columns, name filter) and a
+// WinDirStat-style squarified treemap (src/treemap.*), in tabs.
 //
 // The scan runs on a background thread (see scanner.h); the UI polls a
 // ScanProgress while it runs and takes ownership of the ScanResult when done.
-// The tree view renders straight out of the scanner's CSR child index, which
-// is already sorted by size.
+// Deletions go to the Recycle Bin (SHFileOperationW + FOF_ALLOWUNDO) on a
+// background thread, then the in-memory tree is updated without a rescan.
 //
 // The linker manifest requests Administrator elevation (raw volume access),
 // so double-clicking the exe shows a UAC prompt.
@@ -15,7 +18,9 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <shellapi.h>
+#include <objbase.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cwctype>
 #include <memory>
@@ -27,16 +32,22 @@
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
 #include "scanner.h"
+#include "treemap.h"
 
 // ============================================================================
 // Application state
 // ============================================================================
 
+enum TreeColumn : ImGuiID {
+    ColName = 0, ColSize, ColPercent, ColFiles, ColFolders
+};
+
 struct App {
     std::vector<std::wstring> Drives;
     std::vector<std::string>  DriveLabels; // UTF-8 copies for ImGui
-    int  DriveIndex = 0;
-    bool AutoScan   = false;               // --autoscan: start scanning at launch
+    int  DriveIndex  = 0;
+    bool AutoScan    = false;              // --autoscan: start scanning at launch
+    bool OpenTreemap = false;              // --view treemap: select treemap tab
 
     std::unique_ptr<yadua::ScanResult> Result;   // owned by the UI thread
     std::unique_ptr<yadua::ScanResult> Pending;  // being filled by the scan thread
@@ -51,6 +62,25 @@ struct App {
     // descendant. Empty vector means "no filter, everything visible".
     char                 Filter[256] = {};
     std::vector<uint8_t> Visible;
+
+    // Tree sorting. The scanner's child index is size-descending (canonical);
+    // any other order lives in SortedChildren (parallel to Children.List).
+    std::vector<uint32_t> SortedChildren;
+    bool                  UseSorted = false;
+
+    TreemapView Treemap;
+
+    // Recycle-bin deletion (one at a time, on a background thread because the
+    // shell can take a while on big folders).
+    uint32_t          ConfirmDelete = UINT32_MAX; // node awaiting confirmation
+    bool              Deleting      = false;
+    std::atomic<bool> DeleteDone{false};
+    std::thread       DeleteThread;
+    uint32_t          DeleteNode    = UINT32_MAX;
+    std::wstring      DeletePath;
+    int               DeleteResult  = 0;    // SHFileOperation return code
+    bool              DeleteAborted = false;
+    std::string       Status;               // last action feedback, UTF-8
 };
 
 static void ListNtfsDrives(App& app) {
@@ -69,7 +99,7 @@ static void ListNtfsDrives(App& app) {
 }
 
 static void StartScan(App& app) {
-    if (app.Scanning || app.Drives.empty()) return;
+    if (app.Scanning || app.Deleting || app.Drives.empty()) return;
     if (app.ScanThread.joinable()) app.ScanThread.join();
     app.Pending = std::make_unique<yadua::ScanResult>();
     app.Progress.BytesRead  = 0;
@@ -86,6 +116,10 @@ static void StartScan(App& app) {
         app.ScanDone = true; // release: PendingError/Pending written before this
     });
 }
+
+// ============================================================================
+// Filtering & sorting
+// ============================================================================
 
 // Recompute the visibility map for the current filter: mark every node whose
 // name contains the (case-insensitive) needle, then mark all its ancestors so
@@ -116,12 +150,147 @@ static void RecomputeFilter(App& app) {
     }
 }
 
+// Allocation-free case-insensitive name compare straight out of the arena
+// (a comparator that builds std::wstrings would dominate the sort time).
+static int CompareNames(const yadua::ScanResult& r, uint32_t a, uint32_t b) {
+    const wchar_t* pa = r.NameArena.data() + r.Nodes[a].NameOffset;
+    const wchar_t* pb = r.NameArena.data() + r.Nodes[b].NameOffset;
+    uint16_t la = r.Nodes[a].NameLength, lb = r.Nodes[b].NameLength;
+    for (uint16_t i = 0; i < la && i < lb; ++i) {
+        wchar_t ca = towlower(pa[i]), cb = towlower(pb[i]);
+        if (ca != cb) return ca < cb ? -1 : 1;
+    }
+    return la == lb ? 0 : (la < lb ? -1 : 1);
+}
+
+// Re-sort every directory's child range by the clicked column. The canonical
+// order (size descending) needs no copy; anything else sorts a parallel list.
+static void ApplySort(App& app, const ImGuiTableColumnSortSpecs& spec) {
+    const yadua::ScanResult& r = *app.Result;
+    bool asc = spec.SortDirection == ImGuiSortDirection_Ascending;
+
+    if (spec.ColumnUserID == ColSize && !asc) { app.UseSorted = false; return; }
+
+    app.SortedChildren = r.Children.List;
+    auto key = [&](uint32_t n) -> uint64_t {
+        switch (spec.ColumnUserID) {
+            case ColFiles:   return r.IsDir(n) ? r.Totals[n].FileCount : 0;
+            case ColFolders: return r.IsDir(n) ? r.Totals[n].DirCount : 0;
+            default:         return r.SizeOf(n); // ColSize / ColPercent
+        }
+    };
+    for (size_t d = 0; d + 1 < r.Children.Offset.size(); ++d) {
+        auto begin = app.SortedChildren.begin() + r.Children.Offset[d];
+        auto end   = app.SortedChildren.begin() + r.Children.Offset[d + 1];
+        if (spec.ColumnUserID == ColName)
+            std::sort(begin, end, [&](uint32_t a, uint32_t b) {
+                int c = CompareNames(r, a, b);
+                return asc ? c < 0 : c > 0;
+            });
+        else
+            std::sort(begin, end, [&](uint32_t a, uint32_t b) {
+                return asc ? key(a) < key(b) : key(a) > key(b);
+            });
+    }
+    app.UseSorted = true;
+}
+
 // ============================================================================
-// Tree view
+// Deletion (Recycle Bin)
 // ============================================================================
 
-static void NodeContextMenu(const yadua::ScanResult& r, uint32_t idx) {
-    if (!ImGui::BeginPopupContextItem()) return;
+static void StartDelete(App& app, uint32_t node) {
+    if (app.Deleting || app.Scanning || !app.Result) return;
+    if (app.DeleteThread.joinable()) app.DeleteThread.join();
+    app.DeleteNode   = node;
+    app.DeletePath   = app.Result->Path(node);
+    app.DeleteDone   = false;
+    app.Deleting     = true;
+    std::wstring path = app.DeletePath;
+    app.DeleteThread = std::thread([&app, path] {
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        std::wstring from = path;
+        from.push_back(L'\0'); // SHFileOperation wants double-null termination
+        SHFILEOPSTRUCTW op{};
+        op.wFunc  = FO_DELETE;
+        op.pFrom  = from.c_str();
+        op.fFlags = FOF_ALLOWUNDO; // Recycle Bin, shell shows progress UI
+        app.DeleteResult  = SHFileOperationW(&op);
+        app.DeleteAborted = op.fAnyOperationsAborted;
+        CoUninitialize();
+        app.DeleteDone = true;
+    });
+}
+
+// After a successful recycle: subtract the subtree from every ancestor's
+// totals and flag all its nodes as gone, so tree/treemap/filter skip them
+// without a rescan.
+static void RemoveSubtree(yadua::ScanResult& r, uint32_t idx) {
+    uint64_t logical, allocated, files, dirs;
+    if (r.IsDir(idx)) {
+        logical   = r.Totals[idx].LogicalSize;
+        allocated = r.Totals[idx].AllocatedSize;
+        files     = r.Totals[idx].FileCount;
+        dirs      = r.Totals[idx].DirCount + 1; // + the folder itself
+    } else {
+        logical   = r.Nodes[idx].LogicalSize;
+        allocated = r.Nodes[idx].AllocatedSize;
+        files     = 1;
+        dirs      = 0;
+    }
+    r.FileCount -= files;
+    r.DirCount  -= dirs;
+
+    uint32_t cur = r.Nodes[idx].Parent;
+    for (int depth = 0; depth < 512; ++depth) {
+        if (cur >= r.Nodes.size() || !r.IsDir(cur)) break;
+        yadua::DirTotals& t = r.Totals[cur];
+        t.LogicalSize   -= logical;
+        t.AllocatedSize -= allocated;
+        t.FileCount     -= files;
+        t.DirCount      -= dirs;
+        if (r.Nodes[cur].Parent == cur) break; // root
+        cur = r.Nodes[cur].Parent;
+    }
+
+    // Flag the whole subtree as gone (iterative DFS over the child index).
+    std::vector<uint32_t> stack{idx};
+    while (!stack.empty()) {
+        uint32_t n = stack.back();
+        stack.pop_back();
+        r.Nodes[n].Flags = 0;
+        for (uint32_t c = r.Children.Offset[n]; c < r.Children.Offset[n + 1]; ++c)
+            stack.push_back(r.Children.List[c]);
+    }
+}
+
+static void FinishDelete(App& app) {
+    app.DeleteThread.join();
+    app.Deleting = false;
+    if (app.DeleteResult == 0 && !app.DeleteAborted) {
+        yadua::ScanResult& r = *app.Result;
+        std::string what = yadua::Utf8(app.DeletePath);
+        app.Status = "Recycled " + what + " (" +
+                     yadua::HumanSize(r.SizeOf(app.DeleteNode)) + ")";
+        RemoveSubtree(r, app.DeleteNode);
+        if (!r.Exists(app.Treemap.Root())) app.Treemap.Reset();
+        app.Treemap.Invalidate();
+        RecomputeFilter(app);
+    } else if (app.DeleteAborted || app.DeleteResult == 1223 /*ERROR_CANCELLED*/) {
+        app.Status = "Delete cancelled";
+    } else {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Delete failed (shell error 0x%X)",
+                 (unsigned)app.DeleteResult);
+        app.Status = buf;
+    }
+}
+
+// ============================================================================
+// Shared context menu (tree rows + treemap rects)
+// ============================================================================
+
+static void NodeMenuItems(App& app, const yadua::ScanResult& r, uint32_t idx) {
     if (ImGui::MenuItem("Open in Explorer")) {
         std::wstring args = L"/select,\"" + r.Path(idx) + L"\"";
         ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(),
@@ -129,18 +298,35 @@ static void NodeContextMenu(const yadua::ScanResult& r, uint32_t idx) {
     }
     if (ImGui::MenuItem("Copy path"))
         ImGui::SetClipboardText(yadua::Utf8(r.Path(idx)).c_str());
-    ImGui::EndPopup();
+    if (ImGui::MenuItem("Properties")) {
+        SHELLEXECUTEINFOW sei{sizeof(sei)};
+        sei.fMask  = SEE_MASK_INVOKEIDLIST;
+        sei.lpVerb = L"properties";
+        std::wstring path = r.Path(idx);
+        sei.lpFile = path.c_str();
+        sei.nShow  = SW_SHOW;
+        ShellExecuteExW(&sei);
+    }
+    ImGui::Separator();
+    ImGui::BeginDisabled(idx == (uint32_t)yadua::kRootRecord || app.Deleting);
+    if (ImGui::MenuItem("Delete (Recycle Bin)..."))
+        app.ConfirmDelete = idx;
+    ImGui::EndDisabled();
 }
+
+// ============================================================================
+// Tree view
+// ============================================================================
 
 static void DrawTree(App& app, const yadua::ScanResult& r, uint32_t idx,
                      uint64_t parentSize, bool isRoot) {
-    // Very large directories: render the biggest entries (children are sorted
-    // by size already) and summarize the rest instead of emitting 100k rows.
+    // Very large directories: render the biggest entries and summarize the
+    // rest instead of emitting 100k rows.
     constexpr uint32_t kMaxChildrenShown = 2000;
 
-    const bool     filtered  = !app.Visible.empty();
-    const bool     isDir     = r.IsDir(idx);
-    const uint64_t size      = r.SizeOf(idx);
+    const bool     filtered   = !app.Visible.empty();
+    const bool     isDir      = r.IsDir(idx);
+    const uint64_t size       = r.SizeOf(idx);
     const uint32_t childBegin = r.Children.Offset[idx];
     const uint32_t childEnd   = r.Children.Offset[idx + 1];
     const bool     leaf       = !isDir || childBegin == childEnd;
@@ -157,7 +343,10 @@ static void DrawTree(App& app, const yadua::ScanResult& r, uint32_t idx,
 
     std::string label = isRoot ? yadua::Utf8(r.Drive) : yadua::Utf8(r.Name(idx));
     bool open = ImGui::TreeNodeEx((void*)(intptr_t)idx, flags, "%s", label.c_str());
-    NodeContextMenu(r, idx);
+    if (ImGui::BeginPopupContextItem()) {
+        NodeMenuItems(app, r, idx);
+        ImGui::EndPopup();
+    }
 
     ImGui::TableNextColumn();
     ImGui::TextUnformatted(yadua::HumanSize(size).c_str());
@@ -175,10 +364,13 @@ static void DrawTree(App& app, const yadua::ScanResult& r, uint32_t idx,
     if (isDir) ImGui::Text("%llu", r.Totals[idx].DirCount);
 
     if (open && !leaf) {
+        const uint32_t* list = app.UseSorted ? app.SortedChildren.data()
+                                             : r.Children.List.data();
         uint32_t shown = 0, hidden = 0;
         uint64_t hiddenBytes = 0;
         for (uint32_t c = childBegin; c < childEnd; ++c) {
-            uint32_t child = r.Children.List[c];
+            uint32_t child = list[c];
+            if (!r.Exists(child)) continue;            // recycled this session
             if (filtered && !app.Visible[child]) continue;
             if (shown >= kMaxChildrenShown) {
                 ++hidden;
@@ -191,12 +383,54 @@ static void DrawTree(App& app, const yadua::ScanResult& r, uint32_t idx,
         if (hidden) {
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
-            ImGui::TextDisabled("(... %u smaller items, %s)", hidden,
+            ImGui::TextDisabled("(... %u more items, %s)", hidden,
                                 yadua::HumanSize(hiddenBytes).c_str());
         }
         ImGui::TreePop();
     }
 }
+
+static void DrawTreeTab(App& app, const yadua::ScanResult& r) {
+    if (!ImGui::BeginTable("tree", 5,
+                           ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg |
+                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
+                           ImGuiTableFlags_Sortable))
+        return;
+    float ch = ImGui::GetFontSize();
+    ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 0, ColName);
+    ImGui::TableSetupColumn("Size",
+                            ImGuiTableColumnFlags_WidthFixed |
+                            ImGuiTableColumnFlags_DefaultSort |
+                            ImGuiTableColumnFlags_PreferSortDescending,
+                            ch * 6, ColSize);
+    ImGui::TableSetupColumn("% of parent",
+                            ImGuiTableColumnFlags_WidthFixed |
+                            ImGuiTableColumnFlags_NoSort, ch * 8, ColPercent);
+    ImGui::TableSetupColumn("Files",
+                            ImGuiTableColumnFlags_WidthFixed |
+                            ImGuiTableColumnFlags_PreferSortDescending,
+                            ch * 5, ColFiles);
+    ImGui::TableSetupColumn("Folders",
+                            ImGuiTableColumnFlags_WidthFixed |
+                            ImGuiTableColumnFlags_PreferSortDescending,
+                            ch * 5, ColFolders);
+    ImGui::TableSetupScrollFreeze(0, 1);
+    ImGui::TableHeadersRow();
+
+    if (ImGuiTableSortSpecs* specs = ImGui::TableGetSortSpecs();
+        specs && specs->SpecsDirty) {
+        if (specs->SpecsCount > 0) ApplySort(app, specs->Specs[0]);
+        else app.UseSorted = false; // tri-state: back to canonical order
+        specs->SpecsDirty = false;
+    }
+
+    DrawTree(app, r, (uint32_t)yadua::kRootRecord, 0, true);
+    ImGui::EndTable();
+}
+
+// ============================================================================
+// Top-level UI
+// ============================================================================
 
 static void DrawUi(App& app) {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -217,7 +451,7 @@ static void DrawUi(App& app) {
         ImGui::EndCombo();
     }
     ImGui::SameLine();
-    ImGui::BeginDisabled(app.Scanning);
+    ImGui::BeginDisabled(app.Scanning || app.Deleting);
     if (ImGui::Button(app.Result ? "Rescan" : "Scan")) StartScan(app);
     ImGui::EndDisabled();
     ImGui::SameLine();
@@ -227,14 +461,18 @@ static void DrawUi(App& app) {
         RecomputeFilter(app);
 
     if (app.Result) {
-        const yadua::ScanStats& s = app.Result->Stats;
         ImGui::SameLine();
         ImGui::TextDisabled("| %llu files, %llu folders, %s  (scanned in %.2f s)",
                             app.Result->FileCount, app.Result->DirCount,
                             yadua::HumanSize(
                                 app.Result->Totals[yadua::kRootRecord].LogicalSize)
                                 .c_str(),
-                            s.TotalSeconds);
+                            app.Result->Stats.TotalSeconds);
+    }
+    if (!app.Status.empty()) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1.0f), "| %s",
+                           app.Status.c_str());
     }
     ImGui::Separator();
 
@@ -258,25 +496,65 @@ static void DrawUi(App& app) {
         ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "Scan failed: %s",
                            yadua::Utf8(app.Error).c_str());
     } else if (app.Result) {
-        if (ImGui::BeginTable("tree", 5,
-                              ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg |
-                              ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
-            float ch = ImGui::GetFontSize();
-            ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, ch * 6);
-            ImGui::TableSetupColumn("% of parent",
-                                    ImGuiTableColumnFlags_WidthFixed, ch * 8);
-            ImGui::TableSetupColumn("Files", ImGuiTableColumnFlags_WidthFixed, ch * 5);
-            ImGui::TableSetupColumn("Folders",
-                                    ImGuiTableColumnFlags_WidthFixed, ch * 5);
-            ImGui::TableSetupScrollFreeze(0, 1);
-            ImGui::TableHeadersRow();
-            DrawTree(app, *app.Result, (uint32_t)yadua::kRootRecord, 0, true);
-            ImGui::EndTable();
+        if (ImGui::BeginTabBar("views")) {
+            if (ImGui::BeginTabItem("Tree")) {
+                DrawTreeTab(app, *app.Result);
+                ImGui::EndTabItem();
+            }
+            ImGuiTabItemFlags tmFlags = 0;
+            if (app.OpenTreemap) { tmFlags = ImGuiTabItemFlags_SetSelected;
+                                   app.OpenTreemap = false; }
+            if (ImGui::BeginTabItem("Treemap", nullptr, tmFlags)) {
+                app.Treemap.Draw(*app.Result, [&](uint32_t node) {
+                    NodeMenuItems(app, *app.Result, node);
+                });
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
         }
     } else {
         ImGui::NewLine();
         ImGui::TextDisabled("Pick a drive and hit Scan.");
+    }
+
+    // ---- Delete confirmation + progress modals ------------------------------
+    if (app.ConfirmDelete != UINT32_MAX && !ImGui::IsPopupOpen("Delete?"))
+        ImGui::OpenPopup("Delete?");
+    if (ImGui::BeginPopupModal("Delete?", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        uint32_t idx = app.ConfirmDelete;
+        const yadua::ScanResult& r = *app.Result;
+        ImGui::Text("Move to Recycle Bin?");
+        ImGui::Separator();
+        ImGui::TextUnformatted(yadua::Utf8(r.Path(idx)).c_str());
+        ImGui::TextDisabled("%s%s", yadua::HumanSize(r.SizeOf(idx)).c_str(),
+                            r.IsDir(idx) ? " (entire folder)" : "");
+        ImGui::Separator();
+        if (ImGui::Button("Delete", ImVec2(120, 0))) {
+            StartDelete(app, idx);
+            app.ConfirmDelete = UINT32_MAX;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SetItemDefaultFocus();
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+            app.ConfirmDelete = UINT32_MAX;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    if (app.Deleting && !ImGui::IsPopupOpen("Recycling"))
+        ImGui::OpenPopup("Recycling");
+    if (ImGui::BeginPopupModal("Recycling", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Moving to Recycle Bin...");
+        ImGui::TextUnformatted(yadua::Utf8(app.DeletePath).c_str());
+        if (app.Deleting && app.DeleteDone) {
+            FinishDelete(app);
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
     }
 
     ImGui::End();
@@ -286,12 +564,12 @@ static void DrawUi(App& app) {
 // Win32 + DirectX 11 plumbing (standard Dear ImGui example skeleton)
 // ============================================================================
 
-static ID3D11Device*           g_d3dDevice        = nullptr;
-static ID3D11DeviceContext*    g_d3dContext       = nullptr;
-static IDXGISwapChain*         g_swapChain        = nullptr;
-static ID3D11RenderTargetView* g_renderTarget     = nullptr;
-static UINT                    g_resizeWidth      = 0;
-static UINT                    g_resizeHeight     = 0;
+static ID3D11Device*           g_d3dDevice    = nullptr;
+static ID3D11DeviceContext*    g_d3dContext   = nullptr;
+static IDXGISwapChain*         g_swapChain    = nullptr;
+static ID3D11RenderTargetView* g_renderTarget = nullptr;
+static UINT                    g_resizeWidth  = 0;
+static UINT                    g_resizeHeight = 0;
 
 static void CreateRenderTarget() {
     ID3D11Texture2D* backBuffer = nullptr;
@@ -306,13 +584,13 @@ static void CleanupRenderTarget() {
 
 static bool CreateDeviceD3D(HWND hwnd) {
     DXGI_SWAP_CHAIN_DESC sd{};
-    sd.BufferCount        = 2;
-    sd.BufferDesc.Format  = DXGI_FORMAT_R8G8B8A8_UNORM;
-    sd.BufferUsage        = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.OutputWindow       = hwnd;
-    sd.SampleDesc.Count   = 1;
-    sd.Windowed           = TRUE;
-    sd.SwapEffect         = DXGI_SWAP_EFFECT_DISCARD;
+    sd.BufferCount      = 2;
+    sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.BufferUsage      = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.OutputWindow     = hwnd;
+    sd.SampleDesc.Count = 1;
+    sd.Windowed         = TRUE;
+    sd.SwapEffect       = DXGI_SWAP_EFFECT_DISCARD;
 
     D3D_FEATURE_LEVEL level;
     const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_0,
@@ -361,6 +639,7 @@ static LRESULT WINAPI WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
     ImGui_ImplWin32_EnableDpiAwareness();
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED); // shell verbs (Properties)
 
     WNDCLASSEXW wc = {sizeof(wc), CS_CLASSDC, WndProc, 0, 0, instance,
                       nullptr, LoadCursorW(nullptr, IDC_ARROW), nullptr, nullptr,
@@ -396,7 +675,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
 
     App app;
     ListNtfsDrives(app);
-    app.AutoScan = cmdLine && wcsstr(cmdLine, L"--autoscan") != nullptr;
+    app.AutoScan    = cmdLine && wcsstr(cmdLine, L"--autoscan") != nullptr;
+    app.OpenTreemap = cmdLine && wcsstr(cmdLine, L"--view treemap") != nullptr;
 
     bool done = false;
     while (!done) {
@@ -422,6 +702,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
             app.Scanning = false;
             if (app.PendingError.empty()) {
                 app.Result = std::move(app.Pending);
+                app.UseSorted = false;
+                app.Treemap.Reset();
+                app.Status.clear();
                 RecomputeFilter(app);
             } else {
                 app.Error = std::move(app.PendingError);
@@ -443,6 +726,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
     }
 
     if (app.ScanThread.joinable()) app.ScanThread.join();
+    if (app.DeleteThread.joinable()) app.DeleteThread.join();
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();

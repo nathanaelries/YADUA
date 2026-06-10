@@ -38,12 +38,16 @@
 - [x] Filter by name (case-insensitive, auto-expands to matches)
 - [x] Right-click: Open in Explorer, Copy path
 - [x] Rescan button, background scan with progress bar
-- [ ] Treemap visualization (WinDirStat-style squarified treemap)
+- [x] Treemap visualization (squarified, extension-colored, zoom via
+      double-click, hover tooltips, cached layout)
+- [x] Right-click: Delete to Recycle Bin (confirmation modal, background
+      shell op, in-memory tree update without rescan), Properties
+- [x] Sortable columns (name/size/files/folders, asc/desc, tri-state back
+      to size order)
 - [ ] Filter by size / extension
-- [ ] Right-click: Delete (to Recycle Bin), Properties
 - [ ] Per-folder rescan
-- [ ] File-type coloring, icons
-- [ ] Sortable columns (currently always by size)
+- [ ] File-type icons in the tree; treemap cushion shading
+- [ ] Tree <-> treemap selection sync
 
 ## Phase 3 — Polish
 

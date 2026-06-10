@@ -22,7 +22,7 @@ $cli = "cl $common /W4 `"$root\src\cli.cpp`" `"$root\src\scanner.cpp`"" +
 # GUI: /W3 because the vendored imgui sources are not /W4-clean.
 # The manifest requests Administrator elevation (raw volume access).
 $guiSrc = @(
-    "$root\src\gui.cpp", "$root\src\scanner.cpp",
+    "$root\src\gui.cpp", "$root\src\treemap.cpp", "$root\src\scanner.cpp",
     "$imgui\imgui.cpp", "$imgui\imgui_draw.cpp",
     "$imgui\imgui_tables.cpp", "$imgui\imgui_widgets.cpp",
     "$imgui\backends\imgui_impl_win32.cpp", "$imgui\backends\imgui_impl_dx11.cpp"
