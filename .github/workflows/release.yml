@@ -1,0 +1,109 @@
+# ============================================================================
+# Release workflow: build + publish YADUA binaries when a version tag is pushed.
+#
+#   git tag v1.2.3 && git push origin v1.2.3
+#
+# YADUA is Windows-only by nature (raw NTFS volume access via Win32 +
+# a DirectX 11 GUI), so there are no Linux/macOS targets. We build both
+# Windows architectures: amd64 (x64) and arm64 (cross-compiled with MSVC's
+# amd64_arm64 toolchain, which the hosted runner image includes).
+#
+# Produced release assets (per tag, e.g. v1.2.3):
+#   YADUA-v1.2.3-windows-amd64.exe       GUI app
+#   YADUA-v1.2.3-windows-arm64.exe
+#   YADUA-cli-v1.2.3-windows-amd64.exe   console scanner / CSV+JSON export
+#   YADUA-cli-v1.2.3-windows-arm64.exe
+#   SHA256SUMS.txt                       checksums for all of the above
+# ============================================================================
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'          # v1.0.0, v2.3.1, v1.0.0-rc1, ...
+
+permissions:
+  contents: write     # needed by the release job to create the GitHub Release
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Build both architectures in parallel on the hosted Windows runner.
+  # --------------------------------------------------------------------------
+  build:
+    name: build windows-${{ matrix.arch }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@v5
+
+      # build.ps1 locates MSVC via vswhere and runs vcvarsall for the target
+      # arch, then compiles the CLI, the Dear ImGui GUI, and the icon resource.
+      - name: Build (MSVC, ${{ matrix.arch }})
+        shell: pwsh
+        run: ./build.ps1 -Arch ${{ matrix.arch }}
+
+      # The amd64 binaries can run on the amd64 runner; make sure the CLI at
+      # least starts and prints usage before we ship it. (arm64 can't execute
+      # here, so it only gets the build itself as validation.)
+      - name: Smoke test (amd64 only)
+        if: matrix.arch == 'amd64'
+        shell: pwsh
+        run: |
+          ./yadua.exe --help
+          if ($LASTEXITCODE -ne 0) { throw "CLI smoke test failed" }
+
+      # Rename to the clean, consistent release filenames.
+      - name: Stage release assets
+        shell: pwsh
+        run: |
+          $tag  = '${{ github.ref_name }}'
+          $arch = '${{ matrix.arch }}'
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item yadua-gui.exe "dist/YADUA-$tag-windows-$arch.exe"
+          Copy-Item yadua.exe     "dist/YADUA-cli-$tag-windows-$arch.exe"
+          Get-ChildItem dist
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # Collect every architecture's binaries, checksum them, and publish a
+  # GitHub Release for the tag.
+  # --------------------------------------------------------------------------
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true   # flatten binaries-amd64 + binaries-arm64
+
+      # Checksums let users verify their download; one file covering all assets.
+      - name: Generate SHA256SUMS.txt
+        working-directory: dist
+        run: sha256sum * | tee SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          # Auto-generate notes from merged PRs/commits since the last tag.
+          generate_release_notes: true
+          # Tags like v1.0.0-rc1 / v2.0.0-beta.2 become pre-releases.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          # Fail loudly if a glob matched nothing instead of shipping a
+          # half-empty release.
+          fail_on_unmatched_files: true

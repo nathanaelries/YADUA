@@ -1,4 +1,10 @@
 # Builds yadua.exe (CLI) and yadua-gui.exe (Dear ImGui) with the latest MSVC.
+param(
+    # Target architecture: x64 (default) or arm64 (cross-compiled from an
+    # x64 host). 'amd64' is accepted as an alias for x64 (CI convention).
+    [ValidateSet('x64', 'amd64', 'arm64')]
+    [string]$Arch = 'x64'
+)
 $ErrorActionPreference = 'Stop'
 
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -6,7 +12,8 @@ $vsRoot = & $vswhere -latest -products * `
     -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
     -property installationPath
 if (-not $vsRoot) { throw "No MSVC toolchain found (install VS Build Tools with C++ workload)." }
-$vcvars = Join-Path $vsRoot 'VC\Auxiliary\Build\vcvars64.bat'
+$vcvars = Join-Path $vsRoot 'VC\Auxiliary\Build\vcvarsall.bat'
+$vcArch = if ($Arch -eq 'arm64') { 'amd64_arm64' } else { 'x64' }
 
 $root  = $PSScriptRoot
 $obj   = Join-Path $root 'obj'
@@ -36,6 +43,6 @@ $gui = "cl $common /W3 /DUNICODE /D_UNICODE /I`"$imgui`" /I`"$imgui\backends`" $
        " `"/MANIFESTUAC:level='requireAdministrator' uiAccess='false'`"" +
        " d3d11.lib d3dcompiler.lib dxgi.lib user32.lib gdi32.lib shell32.lib ole32.lib"
 
-cmd /c "`"$vcvars`" >nul 2>&1 && $res && $cli && $gui"
+cmd /c "`"$vcvars`" $vcArch >nul 2>&1 && $res && $cli && $gui"
 if ($LASTEXITCODE -ne 0) { throw "Build failed." }
-Write-Host "Built yadua.exe and yadua-gui.exe"
+Write-Host "Built yadua.exe and yadua-gui.exe ($Arch)"
