@@ -57,5 +57,6 @@
 - [ ] Auto-elevation (relaunch with UAC prompt when not admin)
 - [ ] Live updates via USN journal (track changes without rescanning)
 - [ ] Export/import scan snapshots; diff two scans over time
-- [ ] x64 + ARM64 release builds, CI via GitHub Actions
+- [x] x64 + ARM64 release builds, CI via GitHub Actions (tag-triggered
+      release workflow with checksums + generated notes)
 - [ ] Benchmark suite vs. WizTree / WinDirStat / TreeSize

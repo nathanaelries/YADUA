@@ -10,6 +10,12 @@ Measured on this machine: full C: scan (1.81M MFT records, 1.2M files) in
 **~4 seconds**, bounded by sequential read speed of the 1.73 GB MFT. A reader
 thread streams the MFT while a pool of worker threads parses the records.
 
+## Download
+
+Prebuilt Windows binaries (amd64 + arm64, GUI and CLI) are published on the
+[Releases page](https://github.com/nathanaelries/YADUA/releases) for every
+version tag, with SHA-256 checksums.
+
 ## Build
 
 ```powershell

@@ -25,6 +25,11 @@ on:
 permissions:
   contents: write     # needed by the release job to create the GitHub Release
 
+env:
+  # GitHub switches actions to Node 24 by default on 2026-06-16; opt in now
+  # so runs behave identically before and after the cutover.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
 jobs:
   # --------------------------------------------------------------------------
   # Build both architectures in parallel on the hosted Windows runner.
