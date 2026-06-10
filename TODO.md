@@ -55,6 +55,9 @@
 - [x] Tree <-> treemap selection sync ("Reveal in tree" / "Show in treemap"
       context actions, shared selection highlight)
 - [x] Branding: SVG logo + icon, multi-size .ico embedded in both exes
+- [x] Split-pane Tree tab: docked treemap panel under the tree with a
+      draggable splitter and toolbar toggle (Treemap tab keeps the
+      full-screen view; both share zoom/selection state)
 - [x] Per-folder rescan (context menu; splice-rescans the subtree via a
       filesystem walk without a full rescan; allocated sizes in the
       rescanned part become cluster-rounded estimates)

@@ -77,6 +77,10 @@ struct App {
     bool                  UseSorted = false;
 
     TreemapView Treemap;
+    // Treemap panel docked under the tree (the Treemap tab still offers the
+    // full-screen view); height is user-draggable via a splitter.
+    bool  ShowMapPanel   = true;
+    float MapPanelHeight = 0; // 0 = pick a default on first layout
 
     // Recycle-bin deletion (one at a time, on a background thread because the
     // shell can take a while on big folders).
@@ -455,7 +459,9 @@ static void NodeMenuItems(App& app, const yadua::ScanResult& r, uint32_t idx,
             uint32_t target = r.IsDir(idx) ? idx : r.Nodes[idx].Parent;
             if (target < r.Nodes.size() && r.Exists(target) && r.IsDir(target))
                 app.Treemap.SetRoot(target);
-            app.SwitchToTreemap = true;
+            // With the docked panel the zoom is already visible below the
+            // tree; only switch tabs when the panel is hidden.
+            if (!app.ShowMapPanel) app.SwitchToTreemap = true;
         }
     }
     if (r.IsDir(idx) && !(r.Nodes[idx].Flags & yadua::kNodeReparse)) {
@@ -578,7 +584,7 @@ static void DrawTree(App& app, const yadua::ScanResult& r, uint32_t idx,
     }
 }
 
-static void DrawTreeTab(App& app, const yadua::ScanResult& r) {
+static void DrawTreeTable(App& app, const yadua::ScanResult& r) {
     if (!ImGui::BeginTable("tree", 5,
                            ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg |
                            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
@@ -623,6 +629,51 @@ static void DrawTreeTab(App& app, const yadua::ScanResult& r) {
     }
 }
 
+// Tree tab: the tree table on top and (optionally) a docked treemap panel
+// below it, separated by a draggable horizontal splitter.
+static void DrawTreeTab(App& app, const yadua::ScanResult& r) {
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    const float splitter = 6.0f;
+    const float minTree = 120.0f, minMap = 100.0f;
+
+    if (!app.ShowMapPanel || avail.y < minTree + minMap + splitter) {
+        DrawTreeTable(app, r);
+        return;
+    }
+
+    if (app.MapPanelHeight <= 0) app.MapPanelHeight = avail.y * 0.38f;
+    app.MapPanelHeight = std::min(std::max(app.MapPanelHeight, minMap),
+                                  avail.y - minTree - splitter);
+
+    ImGui::BeginChild("##treepane",
+                      ImVec2(0, avail.y - app.MapPanelHeight - splitter));
+    DrawTreeTable(app, r);
+    ImGui::EndChild();
+
+    // Splitter: dragging up grows the map panel.
+    ImGui::InvisibleButton("##split", ImVec2(-FLT_MIN, splitter));
+    if (ImGui::IsItemActive())
+        app.MapPanelHeight -= ImGui::GetIO().MouseDelta.y;
+    if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+    ImVec2 smin = ImGui::GetItemRectMin(), smax = ImGui::GetItemRectMax();
+    float midY = (smin.y + smax.y) * 0.5f;
+    ImGui::GetWindowDrawList()->AddLine(
+        ImVec2(smin.x, midY), ImVec2(smax.x, midY),
+        ImGui::GetColorU32(ImGui::IsItemActive() ? ImGuiCol_SeparatorActive
+                           : ImGui::IsItemHovered() ? ImGuiCol_SeparatorHovered
+                                                    : ImGuiCol_Separator),
+        2.0f);
+
+    ImGui::BeginChild("##mappane");
+    app.Treemap.Draw(r, [&](uint32_t node) {
+        NodeMenuItems(app, *app.Result, node, true);
+    });
+    uint32_t clicked = app.Treemap.ConsumeClicked();
+    if (clicked != UINT32_MAX) app.SelectedNode = clicked;
+    ImGui::EndChild();
+}
+
 // ============================================================================
 // Top-level UI
 // ============================================================================
@@ -659,6 +710,8 @@ static void DrawUi(App& app) {
                           "  setup        name contains \"setup\"\n"
                           "  *.iso        extension filter (or ext:iso)\n"
                           "  >100mb <2gb  size filter (b/kb/mb/gb/tb)");
+    ImGui::SameLine();
+    ImGui::Checkbox("Map panel", &app.ShowMapPanel);
 
     if (app.Result && !app.Rescanning) {
         ImGui::SameLine();

@@ -47,7 +47,9 @@ Launch `yadua-gui.exe` (it requests elevation itself), pick a drive, hit Scan.
 
 - **Tree tab** — sortable columns (click headers), percent-of-parent bars,
   filter box that auto-expands to matches. Filters combine name terms,
-  extensions, and sizes: `setup *.iso >100mb`.
+  extensions, and sizes: `setup *.iso >100mb`. A docked treemap panel sits
+  below the tree (resizable splitter, "Map panel" toggle); zoom and
+  selection stay in sync with the full-screen Treemap tab.
 - **Treemap tab** — WinDirStat-style squarified treemap colored by file
   extension, with toggleable cushion shading. Hover for details,
   double-click to zoom into a folder, Up/Top to zoom out.
