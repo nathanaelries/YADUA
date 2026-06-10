@@ -49,12 +49,24 @@ $guiSrc = @(
     "$imgui\imgui_tables.cpp", "$imgui\imgui_widgets.cpp",
     "$imgui\backends\imgui_impl_win32.cpp", "$imgui\backends\imgui_impl_dx11.cpp"
 ) | ForEach-Object { "`"$_`"" }
+# NOTE: the /MANIFESTUAC value must contain no spaces. The command line
+# travels through cmd /c, and the quoted space-containing form was split by
+# the linker and silently dropped — shipping a GUI that never elevated.
+# uiAccess defaults to 'false', so only the level needs to be set.
 $gui = "cl $common /W3 /DUNICODE /D_UNICODE /I`"$imgui`" /I`"$imgui\backends`" $($guiSrc -join ' ')" +
        " `"$obj\yadua-gui.res`" /Fe:`"$root\yadua-gui.exe`" /Fo:`"$obj`"\\" +
        " /link /SUBSYSTEM:WINDOWS" +
-       " `"/MANIFESTUAC:level='requireAdministrator' uiAccess='false'`"" +
+       " /MANIFEST:EMBED /MANIFESTUAC:level='requireAdministrator'" +
        " d3d11.lib d3dcompiler.lib dxgi.lib user32.lib gdi32.lib shell32.lib ole32.lib"
 
 cmd /c "`"$vcvars`" $vcArch >nul 2>&1 && $res && $cli && $gui"
 if ($LASTEXITCODE -ne 0) { throw "Build failed." }
-Write-Host "Built yadua.exe and yadua-gui.exe ($Arch)"
+
+# The GUI must self-elevate (raw MFT access is the whole point); fail the
+# build if the UAC manifest ever drops out of the binary again.
+$guiBytes = [System.Text.Encoding]::ASCII.GetString(
+    [System.IO.File]::ReadAllBytes("$root\yadua-gui.exe"))
+if ($guiBytes -notmatch 'requireAdministrator') {
+    throw "yadua-gui.exe is missing the requireAdministrator UAC manifest!"
+}
+Write-Host "Built yadua.exe and yadua-gui.exe ($Arch); UAC manifest verified"
