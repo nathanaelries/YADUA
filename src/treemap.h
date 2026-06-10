@@ -30,6 +30,14 @@ public:
     uint32_t Root() const { return root_; }
     uint32_t Selected() const { return selected_; }
 
+    // Node clicked this frame (UINT32_MAX if none); clears on read so the
+    // host can sync its own selection without fighting the tree view's.
+    uint32_t ConsumeClicked() {
+        uint32_t c = clicked_;
+        clicked_ = UINT32_MAX;
+        return c;
+    }
+
     // Draws toolbar + canvas into the current window's remaining space.
     // `contextMenu` is invoked inside a right-click popup with the hit node.
     void Draw(const yadua::ScanResult& r,
@@ -51,6 +59,7 @@ private:
     std::vector<Item> items_;
     uint32_t root_      = (uint32_t)yadua::kRootRecord;
     uint32_t selected_  = UINT32_MAX;
+    uint32_t clicked_   = UINT32_MAX;
     uint32_t popupNode_ = UINT32_MAX;
     ImVec2   builtPos_{0, 0};
     ImVec2   builtSize_{0, 0};

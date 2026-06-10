@@ -237,8 +237,10 @@ void TreemapView::Draw(const ScanResult& r,
             ImGui::EndTooltip();
         }
 
-        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
             selected_ = it.Node;
+            clicked_  = it.Node;
+        }
         if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
             // Zoom: into the dir itself, or into a file's parent directory.
             uint32_t target = (it.IsDir || it.RestCount)

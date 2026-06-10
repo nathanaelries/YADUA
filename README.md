@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.svg" width="440" alt="YADUA"></p>
+
 # YADUA — Yet Another Disk Usage Analyzer
 
 Fast NTFS disk-space analyzer (WizTree-style). Instead of recursively walking
@@ -25,7 +27,8 @@ Produces:
 Launch `yadua-gui.exe` (it requests elevation itself), pick a drive, hit Scan.
 
 - **Tree tab** — sortable columns (click headers), percent-of-parent bars,
-  name filter box that auto-expands to matches.
+  filter box that auto-expands to matches. Filters combine name terms,
+  extensions, and sizes: `setup *.iso >100mb`.
 - **Treemap tab** — WinDirStat-style squarified treemap colored by file
   extension. Hover for details, double-click to zoom into a folder,
   Up/Top to zoom out.
@@ -51,8 +54,9 @@ Options: `--top N` (list length, default 50), `--csv FILE`, `--json FILE`,
 - `src/scanner.h/.cpp` — the scan engine (raw MFT streaming, parallel parse,
   aggregation, child index); used by both frontends
 - `src/cli.cpp` — console frontend + exports
-- `src/gui.cpp` — Dear ImGui frontend (tree view, deletion, sorting)
+- `src/gui.cpp` — Dear ImGui frontend (tree view, deletion, sorting, filters)
 - `src/treemap.h/.cpp` — squarified treemap layout + rendering
+- `assets/` — logo/icon SVGs, generated PNG set, `yadua.ico` + `.rc` resource
 
 ## How it works
 

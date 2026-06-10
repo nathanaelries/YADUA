@@ -58,10 +58,18 @@ struct App {
     std::wstring        PendingError; // written by scan thread before ScanDone
     std::wstring        Error;
 
-    // Name filter: Visible[i] != 0 <=> node i matches or has a matching
+    // Filter: Visible[i] != 0 <=> node i matches or has a matching
     // descendant. Empty vector means "no filter, everything visible".
     char                 Filter[256] = {};
     std::vector<uint8_t> Visible;
+
+    // Cross-view navigation: selection is shared, and either view can ask the
+    // other to show a node (treemap "Reveal in tree" / tree "Show in treemap").
+    uint32_t             SelectedNode = UINT32_MAX;
+    uint32_t             RevealNode   = UINT32_MAX; // tree scrolls here, 1 frame
+    std::vector<uint8_t> RevealOpen;                // ancestors to force open
+    bool                 SwitchToTree    = false;
+    bool                 SwitchToTreemap = false;
 
     // Tree sorting. The scanner's child index is size-descending (canonical);
     // any other order lives in SortedChildren (parallel to Children.List).
@@ -121,23 +129,99 @@ static void StartScan(App& app) {
 // Filtering & sorting
 // ============================================================================
 
-// Recompute the visibility map for the current filter: mark every node whose
-// name contains the (case-insensitive) needle, then mark all its ancestors so
-// the tree path down to each match stays visible.
+// Filter language: space-separated terms, all must match (AND).
+//   foo       name contains "foo" (case-insensitive)
+//   *.iso     extension is "iso" (ext:iso also works)
+//   >100mb    size greater than (files: own size, folders: subtree size)
+//   <1.5gb    size less than    (units: b, kb, mb, gb, tb; bare = bytes)
+struct FilterTerm {
+    enum Kind { Substr, Ext, SizeGT, SizeLT } What = Substr;
+    std::wstring Text;   // lowercased needle / extension
+    uint64_t     Bytes = 0;
+};
+
+static bool ParseSizeToken(const std::wstring& t, uint64_t& out) {
+    size_t i = 0;
+    while (i < t.size() && (iswdigit(t[i]) || t[i] == L'.')) ++i;
+    if (i == 0) return false;
+    double v = _wtof(t.substr(0, i).c_str());
+    std::wstring unit = t.substr(i);
+    double mult;
+    if (unit.empty() || unit == L"b") mult = 1;
+    else if (unit == L"k" || unit == L"kb") mult = 1024.0;
+    else if (unit == L"m" || unit == L"mb") mult = 1048576.0;
+    else if (unit == L"g" || unit == L"gb") mult = 1073741824.0;
+    else if (unit == L"t" || unit == L"tb") mult = 1099511627776.0;
+    else return false;
+    out = (uint64_t)(v * mult);
+    return true;
+}
+
+static std::vector<FilterTerm> ParseFilter(const char* utf8) {
+    std::wstring raw = yadua::Wide(utf8);
+    for (wchar_t& c : raw) c = towlower(c);
+    std::vector<FilterTerm> terms;
+    size_t pos = 0;
+    while (pos < raw.size()) {
+        size_t end = raw.find(L' ', pos);
+        if (end == std::wstring::npos) end = raw.size();
+        std::wstring tok = raw.substr(pos, end - pos);
+        pos = end + 1;
+        if (tok.empty()) continue;
+
+        FilterTerm term;
+        if ((tok[0] == L'>' || tok[0] == L'<') &&
+            ParseSizeToken(tok.substr(1), term.Bytes)) {
+            term.What = tok[0] == L'>' ? FilterTerm::SizeGT : FilterTerm::SizeLT;
+        } else if (tok.rfind(L"ext:", 0) == 0 && tok.size() > 4) {
+            term.What = FilterTerm::Ext;
+            term.Text = tok.substr(4);
+        } else if (tok.rfind(L"*.", 0) == 0 && tok.size() > 2) {
+            term.What = FilterTerm::Ext;
+            term.Text = tok.substr(2);
+        } else {
+            term.What = FilterTerm::Substr;
+            term.Text = tok;
+        }
+        terms.push_back(std::move(term));
+    }
+    return terms;
+}
+
+// Recompute the visibility map for the current filter: mark every node that
+// matches all terms, then mark all its ancestors so the tree path down to
+// each match stays visible.
 static void RecomputeFilter(App& app) {
     const yadua::ScanResult* r = app.Result.get();
-    if (!r || app.Filter[0] == '\0') { app.Visible.clear(); return; }
-
-    std::wstring needle = yadua::Wide(app.Filter);
-    for (wchar_t& c : needle) c = towlower(c);
+    std::vector<FilterTerm> terms = r ? ParseFilter(app.Filter)
+                                      : std::vector<FilterTerm>{};
+    if (terms.empty()) { app.Visible.clear(); return; }
 
     app.Visible.assign(r->Nodes.size(), 0);
     std::wstring name;
     for (uint32_t i = 0; i < r->Nodes.size(); ++i) {
-        if (!r->Exists(i) || app.Visible[i]) continue;
+        if (!r->Exists(i)) continue;
         name = r->Name(i);
         for (wchar_t& c : name) c = towlower(c);
-        if (name.find(needle) == std::wstring::npos) continue;
+
+        bool match = true;
+        for (const FilterTerm& t : terms) {
+            switch (t.What) {
+                case FilterTerm::Substr:
+                    match = name.find(t.Text) != std::wstring::npos;
+                    break;
+                case FilterTerm::Ext:
+                    match = name.size() > t.Text.size() &&
+                            name[name.size() - t.Text.size() - 1] == L'.' &&
+                            name.compare(name.size() - t.Text.size(),
+                                         t.Text.size(), t.Text) == 0;
+                    break;
+                case FilterTerm::SizeGT: match = r->SizeOf(i) > t.Bytes; break;
+                case FilterTerm::SizeLT: match = r->SizeOf(i) < t.Bytes; break;
+            }
+            if (!match) break;
+        }
+        if (!match) continue;
 
         app.Visible[i] = 1;
         uint32_t cur = r->Nodes[i].Parent;
@@ -290,7 +374,32 @@ static void FinishDelete(App& app) {
 // Shared context menu (tree rows + treemap rects)
 // ============================================================================
 
-static void NodeMenuItems(App& app, const yadua::ScanResult& r, uint32_t idx) {
+static void NodeMenuItems(App& app, const yadua::ScanResult& r, uint32_t idx,
+                          bool fromTreemap) {
+    if (fromTreemap) {
+        if (ImGui::MenuItem("Reveal in tree")) {
+            app.SelectedNode = idx;
+            app.RevealNode   = idx;
+            app.RevealOpen.assign(r.Nodes.size(), 0);
+            uint32_t cur = r.Nodes[idx].Parent;
+            for (int depth = 0; depth < 512; ++depth) {
+                if (cur >= r.Nodes.size()) break;
+                app.RevealOpen[cur] = 1;
+                if (r.Nodes[cur].Parent == cur) break;
+                cur = r.Nodes[cur].Parent;
+            }
+            app.SwitchToTree = true;
+        }
+    } else {
+        if (ImGui::MenuItem("Show in treemap")) {
+            app.SelectedNode = idx;
+            uint32_t target = r.IsDir(idx) ? idx : r.Nodes[idx].Parent;
+            if (target < r.Nodes.size() && r.Exists(target) && r.IsDir(target))
+                app.Treemap.SetRoot(target);
+            app.SwitchToTreemap = true;
+        }
+    }
+    ImGui::Separator();
     if (ImGui::MenuItem("Open in Explorer")) {
         std::wstring args = L"/select,\"" + r.Path(idx) + L"\"";
         ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(),
@@ -338,13 +447,18 @@ static void DrawTree(App& app, const yadua::ScanResult& r, uint32_t idx,
                                ImGuiTreeNodeFlags_OpenOnArrow |
                                ImGuiTreeNodeFlags_OpenOnDoubleClick;
     if (leaf) flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+    if (idx == app.SelectedNode) flags |= ImGuiTreeNodeFlags_Selected;
     if (isRoot) ImGui::SetNextItemOpen(true, ImGuiCond_Once);
     else if (filtered && isDir) ImGui::SetNextItemOpen(true); // expand to matches
+    if (!app.RevealOpen.empty() && isDir && app.RevealOpen[idx])
+        ImGui::SetNextItemOpen(true);                         // expand to reveal
 
     std::string label = isRoot ? yadua::Utf8(r.Drive) : yadua::Utf8(r.Name(idx));
     bool open = ImGui::TreeNodeEx((void*)(intptr_t)idx, flags, "%s", label.c_str());
+    if (idx == app.RevealNode) ImGui::SetScrollHereY(0.35f);
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) app.SelectedNode = idx;
     if (ImGui::BeginPopupContextItem()) {
-        NodeMenuItems(app, r, idx);
+        NodeMenuItems(app, r, idx, false);
         ImGui::EndPopup();
     }
 
@@ -370,9 +484,11 @@ static void DrawTree(App& app, const yadua::ScanResult& r, uint32_t idx,
         uint64_t hiddenBytes = 0;
         for (uint32_t c = childBegin; c < childEnd; ++c) {
             uint32_t child = list[c];
+            bool revealing = child == app.RevealNode ||
+                             (!app.RevealOpen.empty() && app.RevealOpen[child]);
             if (!r.Exists(child)) continue;            // recycled this session
-            if (filtered && !app.Visible[child]) continue;
-            if (shown >= kMaxChildrenShown) {
+            if (filtered && !app.Visible[child] && !revealing) continue;
+            if (shown >= kMaxChildrenShown && !revealing) {
                 ++hidden;
                 hiddenBytes += r.SizeOf(child);
                 continue;
@@ -426,6 +542,13 @@ static void DrawTreeTab(App& app, const yadua::ScanResult& r) {
 
     DrawTree(app, r, (uint32_t)yadua::kRootRecord, 0, true);
     ImGui::EndTable();
+
+    // Reveal is a one-shot: ancestors were forced open and the row scrolled
+    // into view this frame; the tree keeps the open state on its own now.
+    if (app.RevealNode != UINT32_MAX) {
+        app.RevealNode = UINT32_MAX;
+        app.RevealOpen.clear();
+    }
 }
 
 // ============================================================================
@@ -456,9 +579,14 @@ static void DrawUi(App& app) {
     ImGui::EndDisabled();
     ImGui::SameLine();
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14.0f);
-    if (ImGui::InputTextWithHint("##filter", "filter by name...",
+    if (ImGui::InputTextWithHint("##filter", "filter: name  *.ext  >100mb",
                                  app.Filter, sizeof(app.Filter)))
         RecomputeFilter(app);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+        ImGui::SetTooltip("Space-separated terms (all must match):\n"
+                          "  setup        name contains \"setup\"\n"
+                          "  *.iso        extension filter (or ext:iso)\n"
+                          "  >100mb <2gb  size filter (b/kb/mb/gb/tb)");
 
     if (app.Result) {
         ImGui::SameLine();
@@ -497,17 +625,24 @@ static void DrawUi(App& app) {
                            yadua::Utf8(app.Error).c_str());
     } else if (app.Result) {
         if (ImGui::BeginTabBar("views")) {
-            if (ImGui::BeginTabItem("Tree")) {
+            ImGuiTabItemFlags treeFlags = 0;
+            if (app.SwitchToTree) { treeFlags = ImGuiTabItemFlags_SetSelected;
+                                    app.SwitchToTree = false; }
+            if (ImGui::BeginTabItem("Tree", nullptr, treeFlags)) {
                 DrawTreeTab(app, *app.Result);
                 ImGui::EndTabItem();
             }
             ImGuiTabItemFlags tmFlags = 0;
-            if (app.OpenTreemap) { tmFlags = ImGuiTabItemFlags_SetSelected;
-                                   app.OpenTreemap = false; }
+            if (app.OpenTreemap || app.SwitchToTreemap) {
+                tmFlags = ImGuiTabItemFlags_SetSelected;
+                app.OpenTreemap = app.SwitchToTreemap = false;
+            }
             if (ImGui::BeginTabItem("Treemap", nullptr, tmFlags)) {
                 app.Treemap.Draw(*app.Result, [&](uint32_t node) {
-                    NodeMenuItems(app, *app.Result, node);
+                    NodeMenuItems(app, *app.Result, node, true);
                 });
+                uint32_t clicked = app.Treemap.ConsumeClicked();
+                if (clicked != UINT32_MAX) app.SelectedNode = clicked;
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
@@ -641,9 +776,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
     ImGui_ImplWin32_EnableDpiAwareness();
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED); // shell verbs (Properties)
 
+    HICON icon = LoadIconW(instance, MAKEINTRESOURCEW(1)); // assets/yadua.rc
     WNDCLASSEXW wc = {sizeof(wc), CS_CLASSDC, WndProc, 0, 0, instance,
-                      nullptr, LoadCursorW(nullptr, IDC_ARROW), nullptr, nullptr,
-                      L"YADUA", nullptr};
+                      icon, LoadCursorW(nullptr, IDC_ARROW), nullptr, nullptr,
+                      L"YADUA", icon};
     RegisterClassExW(&wc);
     HWND hwnd = CreateWindowW(wc.lpszClassName,
                               L"YADUA — Yet Another Disk Usage Analyzer",

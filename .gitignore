@@ -5,8 +5,9 @@
 obj/
 imgui.ini
 
-# Local screenshots
+# Local screenshots (but keep committed brand assets)
 *.png
+!assets/*.png
 
 # Scan results (contain local disk contents)
 scan*.csv

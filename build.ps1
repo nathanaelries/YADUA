@@ -15,9 +15,12 @@ New-Item -ItemType Directory -Force $obj | Out-Null
 
 $common = '/nologo /O2 /std:c++20 /EHsc /D_CRT_SECURE_NO_WARNINGS'
 
+# App icon resource, linked into both executables.
+$res = "rc /nologo /fo `"$obj\yadua.res`" `"$root\assets\yadua.rc`""
+
 # CLI: our code only, warnings cranked up.
 $cli = "cl $common /W4 `"$root\src\cli.cpp`" `"$root\src\scanner.cpp`"" +
-       " /Fe:`"$root\yadua.exe`" /Fo:`"$obj`"\\"
+       " `"$obj\yadua.res`" /Fe:`"$root\yadua.exe`" /Fo:`"$obj`"\\"
 
 # GUI: /W3 because the vendored imgui sources are not /W4-clean.
 # The manifest requests Administrator elevation (raw volume access).
@@ -28,11 +31,11 @@ $guiSrc = @(
     "$imgui\backends\imgui_impl_win32.cpp", "$imgui\backends\imgui_impl_dx11.cpp"
 ) | ForEach-Object { "`"$_`"" }
 $gui = "cl $common /W3 /DUNICODE /D_UNICODE /I`"$imgui`" /I`"$imgui\backends`" $($guiSrc -join ' ')" +
-       " /Fe:`"$root\yadua-gui.exe`" /Fo:`"$obj`"\\" +
+       " `"$obj\yadua.res`" /Fe:`"$root\yadua-gui.exe`" /Fo:`"$obj`"\\" +
        " /link /SUBSYSTEM:WINDOWS" +
        " `"/MANIFESTUAC:level='requireAdministrator' uiAccess='false'`"" +
        " d3d11.lib d3dcompiler.lib dxgi.lib user32.lib gdi32.lib shell32.lib ole32.lib"
 
-cmd /c "`"$vcvars`" >nul 2>&1 && $cli && $gui"
+cmd /c "`"$vcvars`" >nul 2>&1 && $res && $cli && $gui"
 if ($LASTEXITCODE -ne 0) { throw "Build failed." }
 Write-Host "Built yadua.exe and yadua-gui.exe"

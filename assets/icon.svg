@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- App icon: the YADUA emblem - tapered swoosh ring, accent arc, orbit dot.
+       Thicker proportions than the logo so it survives 16x16. -->
+  <defs>
+    <linearGradient id="ring" x1="60" y1="30" x2="190" y2="230"
+                    gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3fc6ec"/>
+      <stop offset="0.5" stop-color="#1e6cc0"/>
+      <stop offset="1" stop-color="#143f86"/>
+    </linearGradient>
+  </defs>
+
+  <!-- main swoosh: two arcs of different radii sharing endpoints -> tapered ring -->
+  <path d="M46.1,82.6 A100,100 0 1 1 28.4,148.7 A90,90 0 1 0 46.1,82.6 Z"
+        fill="url(#ring)"/>
+  <!-- thin accent arc above (flatter inner arc -> shallow tapered sliver) -->
+  <path d="M52.1,49.6 A118,118 0 0 1 123.9,22.1 A500,500 0 0 0 52.1,49.6 Z"
+        fill="#4fc9ec"/>
+  <!-- orbiting dot -->
+  <circle cx="128" cy="20" r="15" fill="#1e6cc0"/>
+</svg>

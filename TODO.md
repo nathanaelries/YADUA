@@ -44,10 +44,13 @@
       shell op, in-memory tree update without rescan), Properties
 - [x] Sortable columns (name/size/files/folders, asc/desc, tri-state back
       to size order)
-- [ ] Filter by size / extension
+- [x] Filter by size / extension (`*.iso`, `ext:iso`, `>100mb`, `<2gb`,
+      combined with name terms, AND semantics)
+- [x] Tree <-> treemap selection sync ("Reveal in tree" / "Show in treemap"
+      context actions, shared selection highlight)
+- [x] Branding: SVG logo + icon, multi-size .ico embedded in both exes
 - [ ] Per-folder rescan
 - [ ] File-type icons in the tree; treemap cushion shading
-- [ ] Tree <-> treemap selection sync
 
 ## Phase 3 — Polish
 

@@ -1,0 +1,3 @@
+// Application icon resource. ID 1 = first icon = what Explorer shows for the
+// exe and what the window class loads at runtime.
+1 ICON "yadua.ico"
