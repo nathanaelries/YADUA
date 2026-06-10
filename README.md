@@ -5,7 +5,8 @@ directories, it reads the volume's Master File Table directly with raw volume
 I/O and rebuilds the whole tree in memory.
 
 Measured on this machine: full C: scan (1.81M MFT records, 1.2M files) in
-**~5 seconds**, bounded by sequential read speed of the 1.73 GB MFT.
+**~4 seconds**, bounded by sequential read speed of the 1.73 GB MFT. A reader
+thread streams the MFT while a pool of worker threads parses the records.
 
 ## Build
 
@@ -16,8 +17,14 @@ Measured on this machine: full C: scan (1.81M MFT records, 1.2M files) in
 ## Run (requires Administrator — raw volume access)
 
 ```powershell
-yadua.exe C: --top 50 --csv results.csv
+yadua.exe C: --top 50 --csv results.csv --json results.json
+yadua.exe C: --all --csv full.csv      # one row per file/folder on the volume
+yadua.exe C: --all --json full.json    # adds a nested "tree" object
 ```
+
+Options: `--top N` (list length, default 50), `--csv FILE`, `--json FILE`,
+`--all` (export the entire tree instead of just the top-N lists),
+`--threads N` (parser threads, default auto).
 
 ## How it works
 

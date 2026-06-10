@@ -5,5 +5,7 @@
 
 # Scan results (contain local disk contents)
 scan*.csv
+scan*.json
 scan_output.txt
 results.csv
+results.json

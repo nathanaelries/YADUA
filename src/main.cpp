@@ -1,5 +1,5 @@
 // ============================================================================
-// YADUA - Yet Another Disk Usage Analyzer (proof of concept)
+// YADUA - Yet Another Disk Usage Analyzer
 //
 // Fast disk-space scanner for NTFS volumes. Instead of recursively walking
 // directories with FindFirstFile/FindNextFile (one syscall round-trip per
@@ -10,16 +10,21 @@
 //   2. Ask NTFS where the MFT lives:  FSCTL_GET_NTFS_VOLUME_DATA
 //   3. Read MFT record 0 ($MFT itself), decode its $DATA run list to learn
 //      every on-disk extent of the MFT.
-//   4. Stream the whole MFT with large sequential reads (~4 MB chunks).
+//   4. Stream the whole MFT with large sequential reads on a reader thread
+//      while a pool of worker threads parses the records in parallel.
 //   5. Parse each 1 KB FILE record: name + parent ref ($FILE_NAME attribute),
 //      size ($DATA attribute), in-use / directory flags.
-//   6. Rebuild the tree in memory by following parent references and
-//      aggregate folder sizes bottom-up.
+//   6. Reconstruct the directory tree from parent references and aggregate
+//      folder sizes bottom-up.
 //
-// The MFT for a volume with ~2M files is ~2 GB at most (usually far less),
-// and we read it sequentially — so the whole scan is bounded by sequential
-// disk throughput, not by per-file syscalls. This is the same trick WizTree
-// and ntfs-3g's tooling use.
+// Concurrency model: each MFT record lives in exactly one chunk, and each
+// chunk is parsed by exactly one worker, so writes to a record's own Node are
+// exclusive. The two cross-thread cases are handled explicitly:
+//   - extension records add sizes to their *base* record's node, which may be
+//     owned by another worker -> contributions are queued per-thread and
+//     applied single-threaded after the parse;
+//   - names are appended to per-thread arenas and merged (offsets rebased)
+//     after the parse.
 //
 // Requires Administrator privileges (raw volume access).
 // Build: see build.ps1 (cl /O2 /std:c++20).
@@ -32,10 +37,15 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <functional>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 // ============================================================================
@@ -131,18 +141,19 @@ struct FileNameAttribute {
 // In-memory tree
 // ============================================================================
 
-// One entry per MFT record. Kept deliberately small (40 bytes) because a big
-// volume has millions of records; names live in a shared UTF-16 arena.
+// One entry per MFT record. Kept deliberately small because a big volume has
+// millions of records; names live in a shared UTF-16 arena.
 struct Node {
-    uint64_t LogicalSize  = 0;  // file size (EOF) of the unnamed $DATA stream
+    uint64_t LogicalSize   = 0; // file size (EOF) of the unnamed $DATA stream
     uint64_t AllocatedSize = 0; // bytes of disk actually reserved
-    uint32_t NameOffset   = 0;  // into g_nameArena
-    uint32_t Parent       = 0;  // MFT record number of parent directory
-    uint16_t ParentSeq    = 0;  // expected sequence number of the parent record
-    uint16_t Sequence     = 0;  // this record's own sequence number
-    uint16_t NameLength   = 0;  // in WCHARs
-    uint8_t  Flags        = 0;  // bit0 in-use, bit1 directory, bit2 has-name
-    uint8_t  NameRank     = 0xFF; // namespace preference of the stored name
+    uint32_t NameOffset    = 0; // into g_nameArena (after the rebase pass)
+    uint32_t Parent        = 0; // MFT record number of parent directory
+    uint16_t ParentSeq     = 0; // expected sequence number of the parent record
+    uint16_t Sequence      = 0; // this record's own sequence number
+    uint16_t NameLength    = 0; // in WCHARs
+    uint8_t  Flags         = 0; // bit0 in-use, bit1 directory, bit2 has-name
+    uint8_t  NameRank      = 0xFF; // namespace preference of the stored name
+    uint8_t  ThreadId      = 0; // which worker's arena holds the name
 };
 
 constexpr uint8_t kNodeInUse  = 0x01;
@@ -167,6 +178,20 @@ static uint8_t NamespaceRank(uint8_t ns) {
 // ============================================================================
 // Record parsing
 // ============================================================================
+
+// Per-worker scratch state; merged into the globals after the parallel phase.
+struct ParseContext {
+    // Names found by this worker. Node.NameOffset temporarily indexes into
+    // this arena; a post-parse pass rebases it into the merged g_nameArena.
+    std::vector<wchar_t> NameArena;
+
+    // Size contributions from extension records whose base node may be owned
+    // by another worker. Applied single-threaded after the join.
+    struct Contribution { uint32_t Target; uint64_t Logical; uint64_t Allocated; };
+    std::vector<Contribution> Deferred;
+
+    uint8_t ThreadId = 0;
+};
 
 // Multi-sector records are protected against torn writes: the last 2 bytes of
 // every sector hold a copy of the Update Sequence Number and the real bytes
@@ -226,8 +251,10 @@ static std::vector<Extent> DecodeRunList(const uint8_t* p, const uint8_t* end,
     return runs;
 }
 
-// Parse one (fixup-applied) MFT record and fold its information into g_nodes.
-static void ParseRecord(uint8_t* rec, uint32_t recordSize, uint64_t recordIndex) {
+// Parse one MFT record and fold its information into g_nodes / the context.
+static void ParseRecord(uint8_t* rec, uint32_t recordSize, uint64_t recordIndex,
+                        ParseContext& ctx) {
+    if (recordIndex >= g_nodes.size()) return;
     auto* hdr = reinterpret_cast<FileRecordHeader*>(rec);
     if (hdr->Magic != kFileRecordMagic) return;       // unused/corrupt slot
     if (!(hdr->Flags & kRecordInUse)) return;         // deleted file
@@ -235,7 +262,8 @@ static void ParseRecord(uint8_t* rec, uint32_t recordSize, uint64_t recordIndex)
 
     // Attributes of very large / very fragmented files overflow into
     // "extension" records whose BaseRecord points at the owner. Their $DATA
-    // headers belong to the base file, so fold sizes into the base node.
+    // headers belong to the base file, so their sizes are routed to the base
+    // node — via the deferred queue, because another worker may own it.
     uint64_t targetIndex = recordIndex;
     bool isExtension = false;
     if (hdr->BaseRecord != 0) {
@@ -243,12 +271,14 @@ static void ParseRecord(uint8_t* rec, uint32_t recordSize, uint64_t recordIndex)
         if (targetIndex >= g_nodes.size()) return;
         isExtension = true;
     }
-    Node& node = g_nodes[targetIndex];
-    if (!isExtension) {
-        node.Flags   |= kNodeInUse;
-        node.Sequence = hdr->SequenceNumber;
-        if (hdr->Flags & kRecordIsDirectory) node.Flags |= kNodeIsDir;
+    Node* node = isExtension ? nullptr : &g_nodes[targetIndex];
+    if (node) {
+        node->Flags   |= kNodeInUse;
+        node->Sequence = hdr->SequenceNumber;
+        if (hdr->Flags & kRecordIsDirectory) node->Flags |= kNodeIsDir;
     }
+
+    uint64_t addLogical = 0, addAllocated = 0;
 
     // Walk the attribute list. Every offset comes from disk, so bounds-check
     // everything — a single bad record must not crash the scan.
@@ -260,7 +290,7 @@ static void ParseRecord(uint8_t* rec, uint32_t recordSize, uint64_t recordIndex)
         if (attr->Length < sizeof(AttributeHeader) || offset + attr->Length > limit)
             break;
 
-        if (attr->Type == kAttrFileName && !attr->NonResident && !isExtension) {
+        if (attr->Type == kAttrFileName && !attr->NonResident && node) {
             auto* res = reinterpret_cast<ResidentAttribute*>(attr);
             if (res->ValueOffset + sizeof(FileNameAttribute) <= attr->Length) {
                 auto* fn = reinterpret_cast<FileNameAttribute*>(
@@ -269,19 +299,21 @@ static void ParseRecord(uint8_t* rec, uint32_t recordSize, uint64_t recordIndex)
                 uint8_t  rank      = NamespaceRank(fn->NameSpace);
                 // Keep the best-ranked name. A file with several Win32 names
                 // is a hard link; we keep the first one we see (counted once).
-                if (rank < node.NameRank &&
+                if (rank < node->NameRank &&
                     res->ValueOffset + sizeof(FileNameAttribute) + nameBytes
                         <= attr->Length) {
-                    node.NameRank   = rank;
-                    node.Parent     = static_cast<uint32_t>(
+                    node->NameRank   = rank;
+                    node->Parent     = static_cast<uint32_t>(
                         fn->ParentRef & 0x0000FFFFFFFFFFFFull);
-                    node.ParentSeq  = static_cast<uint16_t>(fn->ParentRef >> 48);
-                    node.NameOffset = static_cast<uint32_t>(g_nameArena.size());
-                    node.NameLength = fn->NameLength;
-                    node.Flags     |= kNodeNamed;
+                    node->ParentSeq  = static_cast<uint16_t>(fn->ParentRef >> 48);
+                    node->NameOffset = static_cast<uint32_t>(ctx.NameArena.size());
+                    node->NameLength = fn->NameLength;
+                    node->ThreadId   = ctx.ThreadId;
+                    node->Flags     |= kNodeNamed;
                     const wchar_t* name = reinterpret_cast<wchar_t*>(
                         rec + offset + res->ValueOffset + sizeof(FileNameAttribute));
-                    g_nameArena.insert(g_nameArena.end(), name, name + fn->NameLength);
+                    ctx.NameArena.insert(ctx.NameArena.end(),
+                                         name, name + fn->NameLength);
                 }
             }
         } else if (attr->Type == kAttrData && attr->NameLength == 0) {
@@ -294,22 +326,30 @@ static void ParseRecord(uint8_t* rec, uint32_t recordSize, uint64_t recordIndex)
                 // total sizes; continuation headers in extension records
                 // repeat nothing and must not be double-counted.
                 if (nr->LowestVcn == 0 && offset + sizeof(NonResidentAttribute) <= limit) {
-                    node.LogicalSize   += nr->RealSize;
-                    node.AllocatedSize += nr->AllocatedSize;
+                    addLogical   += nr->RealSize;
+                    addAllocated += nr->AllocatedSize;
                 }
             } else {
                 auto* res = reinterpret_cast<ResidentAttribute*>(attr);
-                node.LogicalSize += res->ValueLength;
+                addLogical += res->ValueLength;
                 // resident data occupies no clusters of its own => allocated 0
             }
         }
 
         offset += attr->Length;
     }
+
+    if (node) {
+        node->LogicalSize   += addLogical;
+        node->AllocatedSize += addAllocated;
+    } else if (addLogical || addAllocated) {
+        ctx.Deferred.push_back({static_cast<uint32_t>(targetIndex),
+                                addLogical, addAllocated});
+    }
 }
 
 // ============================================================================
-// MFT streaming
+// MFT streaming (reader thread + worker pool)
 // ============================================================================
 
 static bool ReadAt(HANDLE volume, uint64_t offset, void* buffer, uint32_t bytes) {
@@ -320,52 +360,181 @@ static bool ReadAt(HANDLE volume, uint64_t offset, void* buffer, uint32_t bytes)
     return ReadFile(volume, buffer, bytes, &read, &ov) && read == bytes;
 }
 
-// Feeds raw MFT bytes (in VCN order) through a reassembly buffer so that a
-// FILE record split across two non-contiguous extents (possible when cluster
-// size < record size, e.g. 512-byte clusters) is still parsed correctly.
-class RecordStream {
-public:
-    RecordStream(uint32_t recordSize, uint64_t maxRecords)
-        : recordSize_(recordSize), maxRecords_(maxRecords) {
-        carry_.reserve(recordSize);
-    }
-
-    void Feed(uint8_t* data, size_t bytes) {
-        size_t pos = 0;
-        if (!carry_.empty()) {              // finish a record split across reads
-            size_t need = std::min(recordSize_ - carry_.size(), bytes);
-            carry_.insert(carry_.end(), data, data + need);
-            pos = need;
-            if (carry_.size() == recordSize_) {
-                Emit(carry_.data());
-                carry_.clear();
-            }
-        }
-        while (pos + recordSize_ <= bytes) {
-            Emit(data + pos);
-            pos += recordSize_;
-        }
-        if (pos < bytes)
-            carry_.assign(data + pos, data + bytes);
-    }
-
-    uint64_t RecordsParsed() const { return recordIndex_; }
-
-private:
-    void Emit(uint8_t* rec) {
-        if (recordIndex_ < maxRecords_)
-            ParseRecord(rec, recordSize_, recordIndex_);
-        ++recordIndex_;
-    }
-
-    uint32_t recordSize_;
-    uint64_t maxRecords_;
-    uint64_t recordIndex_ = 0;
-    std::vector<uint8_t> carry_;
+// A chunk of the $MFT data stream, always holding whole FILE records.
+struct Chunk {
+    std::vector<uint8_t> Data;
+    size_t   Bytes       = 0;   // valid bytes (multiple of the record size)
+    uint64_t FirstRecord = 0;   // stream-wide index of the first record
 };
 
+template <typename T>
+class BlockingQueue {
+public:
+    void Push(T* item) {
+        { std::lock_guard<std::mutex> lock(mutex_); items_.push_back(item); }
+        cv_.notify_one();
+    }
+    // Blocks until an item is available; returns false once the queue is
+    // closed and drained.
+    bool Pop(T*& out) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [&] { return !items_.empty() || closed_; });
+        if (items_.empty()) return false;
+        out = items_.front();
+        items_.pop_front();
+        return true;
+    }
+    void Close() {
+        { std::lock_guard<std::mutex> lock(mutex_); closed_ = true; }
+        cv_.notify_all();
+    }
+private:
+    std::mutex              mutex_;
+    std::condition_variable cv_;
+    std::deque<T*>          items_;
+    bool                    closed_ = false;
+};
+
+struct ScanStats {
+    uint64_t BytesRead     = 0;
+    uint64_t RecordsParsed = 0;
+};
+
+// Streams the MFT (this thread does the I/O) while `workers` threads parse.
+// Returns false on a read error.
+static bool StreamMft(HANDLE volume, const std::vector<Extent>& mftRuns,
+                      uint64_t mftBytes, uint32_t clusterSize, uint32_t recordSize,
+                      unsigned workerCount, std::vector<ParseContext>& contexts,
+                      ScanStats& stats) {
+    constexpr size_t kChunkSize = 8 * 1024 * 1024;
+
+    BlockingQueue<Chunk> readyQueue;  // filled chunks awaiting a parser
+    BlockingQueue<Chunk> freeQueue;   // empty chunks awaiting the reader
+
+    // Enough chunks that the reader can stay ahead of the parsers.
+    std::vector<Chunk> pool(workerCount * 2 + 2);
+    for (Chunk& c : pool) {
+        c.Data.resize(kChunkSize + recordSize + clusterSize);
+        freeQueue.Push(&c);
+    }
+
+    contexts.resize(workerCount);
+    std::vector<std::thread> workers;
+    workers.reserve(workerCount);
+    for (unsigned t = 0; t < workerCount; ++t) {
+        contexts[t].ThreadId = static_cast<uint8_t>(t);
+        contexts[t].NameArena.reserve(4u * 1024 * 1024);
+        workers.emplace_back([&, t] {
+            ParseContext& ctx = contexts[t];
+            Chunk* chunk = nullptr;
+            while (readyQueue.Pop(chunk)) {
+                for (size_t off = 0; off < chunk->Bytes; off += recordSize)
+                    ParseRecord(chunk->Data.data() + off, recordSize,
+                                chunk->FirstRecord + off / recordSize, ctx);
+                freeQueue.Push(chunk);
+            }
+        });
+    }
+
+    // FILE records can straddle chunk (or even extent) boundaries when the
+    // cluster size is smaller than the record size; `carry` holds the partial
+    // record between iterations and is prepended to the next chunk.
+    std::vector<uint8_t> carry;
+    carry.reserve(recordSize);
+    uint64_t nextRecord = 0;
+    bool readError = false;
+
+    // Hand `validBytes` of stream data (carry included) to the parsers; the
+    // sub-record tail goes back into `carry`.
+    auto dispatch = [&](Chunk* chunk, size_t validBytes) {
+        size_t completeBytes = validBytes / recordSize * recordSize;
+        carry.assign(chunk->Data.data() + completeBytes,
+                     chunk->Data.data() + validBytes);
+        if (completeBytes == 0) { freeQueue.Push(chunk); return; }
+        chunk->Bytes       = completeBytes;
+        chunk->FirstRecord = nextRecord;
+        nextRecord += completeBytes / recordSize;
+        readyQueue.Push(chunk);
+    };
+
+    uint64_t streamed = 0; // bytes of the $MFT data stream consumed so far
+    for (const Extent& run : mftRuns) {
+        if (readError || streamed >= mftBytes) break;
+        uint64_t runBytes =
+            std::min(run.Clusters * (uint64_t)clusterSize, mftBytes - streamed);
+
+        for (uint64_t done = 0; done < runBytes; ) {
+            Chunk* chunk = nullptr;
+            freeQueue.Pop(chunk);
+            size_t carryLen = carry.size();
+            if (carryLen) memcpy(chunk->Data.data(), carry.data(), carryLen);
+
+            uint64_t remaining = runBytes - done;
+            if (run.Lcn < 0) {
+                // Sparse run: no clusters on disk, the stream reads as zeros.
+                // Feed zeros to keep record numbering aligned (zero magic =>
+                // records are skipped by the parser).
+                size_t n = (size_t)std::min<uint64_t>(kChunkSize, remaining);
+                memset(chunk->Data.data() + carryLen, 0, n);
+                dispatch(chunk, carryLen + n);
+                done += n;
+            } else {
+                // Reads must be cluster-aligned on disk; round the request up
+                // and feed only the bytes that are real stream data.
+                size_t maxRead = (chunk->Data.size() - carryLen)
+                                 / clusterSize * clusterSize;
+                maxRead = std::min(maxRead, kChunkSize);
+                uint64_t wanted = (remaining + clusterSize - 1)
+                                  / clusterSize * (uint64_t)clusterSize;
+                uint32_t readLen = (uint32_t)std::min<uint64_t>(maxRead, wanted);
+                if (!ReadAt(volume, (uint64_t)run.Lcn * clusterSize + done,
+                            chunk->Data.data() + carryLen, readLen)) {
+                    fprintf(stderr, "error: volume read failed at LCN %lld (%lu)\n",
+                            run.Lcn, GetLastError());
+                    freeQueue.Push(chunk);
+                    readError = true;
+                    break;
+                }
+                stats.BytesRead += readLen;
+                size_t feed = (size_t)std::min<uint64_t>(remaining, readLen);
+                dispatch(chunk, carryLen + feed);
+                done += feed;
+            }
+        }
+        streamed += runBytes;
+    }
+
+    readyQueue.Close();
+    for (std::thread& w : workers) w.join();
+    stats.RecordsParsed = nextRecord;
+    return !readError;
+}
+
+// Merge the per-worker results back into the globals: apply deferred
+// extension-record sizes and rebase name offsets into one shared arena.
+static void MergeContexts(std::vector<ParseContext>& contexts) {
+    for (ParseContext& ctx : contexts)
+        for (const ParseContext::Contribution& c : ctx.Deferred) {
+            g_nodes[c.Target].LogicalSize   += c.Logical;
+            g_nodes[c.Target].AllocatedSize += c.Allocated;
+        }
+
+    std::vector<size_t> arenaBase(contexts.size() + 1, 0);
+    for (size_t t = 0; t < contexts.size(); ++t)
+        arenaBase[t + 1] = arenaBase[t] + contexts[t].NameArena.size();
+
+    g_nameArena.resize(arenaBase.back());
+    for (size_t t = 0; t < contexts.size(); ++t)
+        std::copy(contexts[t].NameArena.begin(), contexts[t].NameArena.end(),
+                  g_nameArena.begin() + arenaBase[t]);
+
+    for (Node& n : g_nodes)
+        if (n.Flags & kNodeNamed)
+            n.NameOffset += static_cast<uint32_t>(arenaBase[n.ThreadId]);
+}
+
 // ============================================================================
-// Aggregation & reporting
+// Aggregation
 // ============================================================================
 
 struct DirTotals {
@@ -411,6 +580,49 @@ static void Aggregate(std::vector<DirTotals>& totals) {
     }
 }
 
+// Child adjacency in CSR form (offsets into one flat child array), used by the
+// full-tree exports. Built from validated parent links only, so a DFS from the
+// root cannot cycle. Children come out sorted by size, largest first.
+struct ChildIndex {
+    std::vector<uint32_t> Offset; // size = nodes + 1
+    std::vector<uint32_t> List;
+};
+
+static ChildIndex BuildChildIndex(const std::vector<DirTotals>& totals) {
+    ChildIndex ci;
+    size_t n = g_nodes.size();
+    ci.Offset.assign(n + 1, 0);
+
+    auto linked = [&](size_t i) {
+        const Node& nd = g_nodes[i];
+        return (nd.Flags & kNodeInUse) && (nd.Flags & kNodeNamed) &&
+               i != kRootRecord && IsValidParent(nd.Parent, nd.ParentSeq);
+    };
+
+    for (size_t i = 0; i < n; ++i)
+        if (linked(i)) ++ci.Offset[g_nodes[i].Parent + 1];
+    for (size_t i = 0; i < n; ++i)
+        ci.Offset[i + 1] += ci.Offset[i];
+
+    ci.List.resize(ci.Offset[n]);
+    std::vector<uint32_t> cursor(ci.Offset.begin(), ci.Offset.end() - 1);
+    for (size_t i = 0; i < n; ++i)
+        if (linked(i)) ci.List[cursor[g_nodes[i].Parent]++] = (uint32_t)i;
+
+    auto sizeOf = [&](uint32_t i) {
+        return (g_nodes[i].Flags & kNodeIsDir) ? totals[i].LogicalSize
+                                               : g_nodes[i].LogicalSize;
+    };
+    for (size_t i = 0; i < n; ++i)
+        std::sort(ci.List.begin() + ci.Offset[i], ci.List.begin() + ci.Offset[i + 1],
+                  [&](uint32_t a, uint32_t b) { return sizeOf(a) > sizeOf(b); });
+    return ci;
+}
+
+// ============================================================================
+// Formatting helpers
+// ============================================================================
+
 static std::wstring NodeName(uint32_t index) {
     const Node& n = g_nodes[index];
     return std::wstring(g_nameArena.data() + n.NameOffset, n.NameLength);
@@ -454,6 +666,142 @@ static std::string HumanSize(uint64_t bytes) {
 }
 
 // ============================================================================
+// Export
+// ============================================================================
+
+static std::string CsvEscape(std::string s) {
+    if (s.find_first_of(",\"") == std::string::npos) return s;
+    std::string out = "\"";
+    for (char c : s) { if (c == '"') out += '"'; out += c; }
+    return out + "\"";
+}
+
+static void JsonWriteString(FILE* f, const std::string& s) {
+    fputc('"', f);
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':  fputs("\\\"", f); break;
+            case '\\': fputs("\\\\", f); break;   // Windows paths!
+            default:
+                if (c < 0x20) fprintf(f, "\\u%04x", c);
+                else fputc(c, f);
+        }
+    }
+    fputc('"', f);
+}
+
+struct TopLists {
+    std::vector<uint32_t> Dirs;   // first DirCount entries sorted by size desc
+    std::vector<uint32_t> Files;  // first FileCount entries sorted by size desc
+    size_t DirCount  = 0;
+    size_t FileCount = 0;
+};
+
+static void ExportCsv(FILE* f, const std::wstring& drive, const TopLists& top,
+                      const std::vector<DirTotals>& totals,
+                      const ChildIndex* tree /* null => top-N only */) {
+    fputs("\xEF\xBB\xBF", f); // UTF-8 BOM so Excel decodes correctly
+    fputs("type,path,size_bytes,allocated_bytes,files,folders\n", f);
+
+    auto folderRow = [&](const std::string& path, uint32_t idx) {
+        fprintf(f, "folder,%s,%llu,%llu,%llu,%llu\n", CsvEscape(path).c_str(),
+                totals[idx].LogicalSize, totals[idx].AllocatedSize,
+                totals[idx].FileCount, totals[idx].DirCount);
+    };
+    auto fileRow = [&](const std::string& path, uint32_t idx) {
+        fprintf(f, "file,%s,%llu,%llu,,\n", CsvEscape(path).c_str(),
+                g_nodes[idx].LogicalSize, g_nodes[idx].AllocatedSize);
+    };
+
+    if (!tree) {
+        for (size_t i = 0; i < top.DirCount; ++i)
+            folderRow(Utf8(BuildPath(top.Dirs[i], drive)), top.Dirs[i]);
+        for (size_t i = 0; i < top.FileCount; ++i)
+            fileRow(Utf8(BuildPath(top.Files[i], drive)), top.Files[i]);
+        return;
+    }
+
+    // Full tree: DFS preorder, reusing one path string instead of rebuilding
+    // the path for each of potentially millions of rows.
+    std::wstring path = drive;
+    std::function<void(uint32_t)> walk = [&](uint32_t idx) {
+        if (g_nodes[idx].Flags & kNodeIsDir) {
+            folderRow(Utf8(path), idx);
+            for (uint32_t c = tree->Offset[idx]; c < tree->Offset[idx + 1]; ++c) {
+                uint32_t child = tree->List[c];
+                size_t len = path.size();
+                path += L'\\';
+                path += NodeName(child);
+                walk(child);
+                path.resize(len);
+            }
+        } else {
+            fileRow(Utf8(path), idx);
+        }
+    };
+    walk(kRootRecord);
+}
+
+static void ExportJson(FILE* f, const std::wstring& drive, const TopLists& top,
+                       const std::vector<DirTotals>& totals,
+                       uint64_t fileCount, uint64_t dirCount,
+                       const ChildIndex* tree /* null => no full tree */) {
+    const DirTotals& root = totals[kRootRecord];
+    fputs("{\n", f);
+    fputs("  \"volume\": ", f);
+    JsonWriteString(f, Utf8(drive));
+    fprintf(f, ",\n  \"files\": %llu,\n  \"folders\": %llu,\n"
+               "  \"total_size\": %llu,\n  \"allocated_size\": %llu,\n",
+            fileCount, dirCount, root.LogicalSize, root.AllocatedSize);
+
+    fputs("  \"top_folders\": [", f);
+    for (size_t i = 0; i < top.DirCount; ++i) {
+        uint32_t idx = top.Dirs[i];
+        fputs(i ? ",\n    " : "\n    ", f);
+        fputs("{\"path\": ", f);
+        JsonWriteString(f, Utf8(BuildPath(idx, drive)));
+        fprintf(f, ", \"size\": %llu, \"allocated\": %llu, "
+                   "\"files\": %llu, \"folders\": %llu}",
+                totals[idx].LogicalSize, totals[idx].AllocatedSize,
+                totals[idx].FileCount, totals[idx].DirCount);
+    }
+    fputs("\n  ],\n  \"top_files\": [", f);
+    for (size_t i = 0; i < top.FileCount; ++i) {
+        uint32_t idx = top.Files[i];
+        fputs(i ? ",\n    " : "\n    ", f);
+        fputs("{\"path\": ", f);
+        JsonWriteString(f, Utf8(BuildPath(idx, drive)));
+        fprintf(f, ", \"size\": %llu, \"allocated\": %llu}",
+                g_nodes[idx].LogicalSize, g_nodes[idx].AllocatedSize);
+    }
+    fputs("\n  ]", f);
+
+    if (tree) {
+        fputs(",\n  \"tree\": ", f);
+        std::function<void(uint32_t, bool)> emit = [&](uint32_t idx, bool isRoot) {
+            fputs("{\"name\": ", f);
+            JsonWriteString(f, isRoot ? Utf8(drive) : Utf8(NodeName(idx)));
+            if (g_nodes[idx].Flags & kNodeIsDir) {
+                fprintf(f, ", \"size\": %llu, \"allocated\": %llu, "
+                           "\"files\": %llu, \"folders\": %llu, \"children\": [",
+                        totals[idx].LogicalSize, totals[idx].AllocatedSize,
+                        totals[idx].FileCount, totals[idx].DirCount);
+                for (uint32_t c = tree->Offset[idx]; c < tree->Offset[idx + 1]; ++c) {
+                    if (c != tree->Offset[idx]) fputc(',', f);
+                    emit(tree->List[c], false);
+                }
+                fputs("]}", f);
+            } else {
+                fprintf(f, ", \"size\": %llu, \"allocated\": %llu}",
+                        g_nodes[idx].LogicalSize, g_nodes[idx].AllocatedSize);
+            }
+        };
+        emit(kRootRecord, true);
+    }
+    fputs("\n}\n", f);
+}
+
+// ============================================================================
 // main
 // ============================================================================
 
@@ -462,16 +810,26 @@ int wmain(int argc, wchar_t** argv) {
 
     std::wstring drive = L"C:";
     int topN = 50;
-    std::wstring csvPath;
+    bool exportAll = false;
+    std::wstring csvPath, jsonPath;
+    unsigned threads = 0;
     for (int i = 1; i < argc; ++i) {
         std::wstring arg = argv[i];
-        if (arg == L"--top" && i + 1 < argc)      topN = _wtoi(argv[++i]);
-        else if (arg == L"--csv" && i + 1 < argc) csvPath = argv[++i];
+        if (arg == L"--top" && i + 1 < argc)          topN = _wtoi(argv[++i]);
+        else if (arg == L"--csv" && i + 1 < argc)     csvPath = argv[++i];
+        else if (arg == L"--json" && i + 1 < argc)    jsonPath = argv[++i];
+        else if (arg == L"--threads" && i + 1 < argc) threads = _wtoi(argv[++i]);
+        else if (arg == L"--all")                     exportAll = true;
         else if (arg == L"--help" || arg == L"-h") {
-            printf("Usage: yadua.exe [drive] [--top N] [--csv out.csv]\n"
-                   "  drive   volume to scan, e.g. C: (default C:)\n"
-                   "  --top   how many entries per list (default 50)\n"
-                   "  --csv   also export the lists to a CSV file\n"
+            printf("Usage: yadua.exe [drive] [options]\n"
+                   "  drive        volume to scan, e.g. C: (default C:)\n"
+                   "  --top N      how many entries per list (default 50)\n"
+                   "  --csv FILE   export to CSV\n"
+                   "  --json FILE  export to JSON\n"
+                   "  --all        export the entire tree, not just the top-N\n"
+                   "               lists (CSV: one row per file/folder; JSON:\n"
+                   "               adds a nested \"tree\" object)\n"
+                   "  --threads N  parser threads (default: auto)\n"
                    "Must be run from an elevated (Administrator) prompt.\n");
             return 0;
         }
@@ -481,6 +839,11 @@ int wmain(int argc, wchar_t** argv) {
             if (drive.size() > 2 && drive.back() == L'\\') drive.pop_back();
         }
     }
+    if (threads == 0) {
+        unsigned hw = std::thread::hardware_concurrency();
+        threads = hw > 3 ? std::min(hw - 2, 8u) : 1u; // leave cores for I/O + OS
+    }
+    threads = std::min(threads, 255u); // ThreadId is a uint8_t
 
     auto t0 = std::chrono::steady_clock::now();
 
@@ -488,7 +851,7 @@ int wmain(int argc, wchar_t** argv) {
     std::wstring volumePath = L"\\\\.\\" + drive;
     HANDLE volume = CreateFileW(volumePath.c_str(), GENERIC_READ,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                                OPEN_EXISTING, 0, nullptr);
+                                OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (volume == INVALID_HANDLE_VALUE) {
         DWORD err = GetLastError();
         fprintf(stderr, "error: cannot open %ls (Win32 error %lu)\n",
@@ -513,9 +876,10 @@ int wmain(int argc, wchar_t** argv) {
     const uint64_t mftBytes    = vol.MftValidDataLength.QuadPart;
     const uint64_t recordCount = mftBytes / recordSize;
 
-    printf("Volume %ls: cluster %u B, MFT record %u B, MFT size %s (%llu records)\n",
+    printf("Volume %ls: cluster %u B, MFT record %u B, MFT size %s "
+           "(%llu records), %u parser threads\n",
            drive.c_str(), clusterSize, recordSize,
-           HumanSize(mftBytes).c_str(), recordCount);
+           HumanSize(mftBytes).c_str(), recordCount, threads);
 
     // ---- 3. Read $MFT's own record (record 0) and decode its run list ----
     // FSCTL only tells us where the MFT *starts*; the MFT itself is usually
@@ -547,9 +911,6 @@ int wmain(int argc, wchar_t** argv) {
                 const uint8_t* rl  = rec0.data() + offset + nr->RunListOffset;
                 const uint8_t* end = rec0.data() + offset + attr->Length;
                 mftRuns = DecodeRunList(rl, end, nr->LowestVcn);
-                // Note: if the MFT is fragmented into hundreds of extents the
-                // run list itself can overflow into an extension record via
-                // $ATTRIBUTE_LIST. Rare in practice; detect and bail loudly.
                 break;
             }
             offset += attr->Length;
@@ -571,55 +932,21 @@ int wmain(int argc, wchar_t** argv) {
         }
     }
 
-    // ---- 4 & 5. Stream the MFT and parse every record ---------------------
+    // ---- 4 & 5. Stream the MFT and parse every record in parallel ---------
     g_nodes.assign(recordCount, Node{});
-    g_nameArena.reserve(recordCount * 12);  // ~12 chars per name on average
 
-    constexpr uint32_t kChunk = 4 * 1024 * 1024;
-    std::vector<uint8_t> chunk(kChunk);
-    std::vector<uint8_t> zeros; // lazily allocated, only if sparse runs exist
-    RecordStream stream(recordSize, recordCount);
-
-    uint64_t bytesRead = 0;
-    uint64_t streamed  = 0;     // bytes of the $MFT data stream fed so far
-    for (const Extent& run : mftRuns) {
-        uint64_t runBytes = run.Clusters * (uint64_t)clusterSize;
-        if (streamed >= mftBytes) break;
-        runBytes = std::min(runBytes, mftBytes - streamed);
-
-        if (run.Lcn < 0) {
-            // Sparse run: no clusters on disk, the stream reads as zeros.
-            // Feed zeros to keep record numbering aligned (zero magic => skipped).
-            if (zeros.empty()) zeros.assign(kChunk, 0);
-            for (uint64_t done = 0; done < runBytes; ) {
-                uint32_t n = (uint32_t)std::min<uint64_t>(kChunk, runBytes - done);
-                stream.Feed(zeros.data(), n);
-                done += n;
-            }
-        } else {
-            uint64_t diskOffset = (uint64_t)run.Lcn * clusterSize;
-            for (uint64_t done = 0; done < runBytes; ) {
-                // Reads must stay sector-aligned: round the tail read up to a
-                // cluster, but feed only the valid bytes to the parser.
-                uint64_t remaining = runBytes - done;
-                uint32_t feed = (uint32_t)std::min<uint64_t>(kChunk, remaining);
-                uint32_t read = ((feed + clusterSize - 1) / clusterSize) * clusterSize;
-                if (!ReadAt(volume, diskOffset + done, chunk.data(), read)) {
-                    fprintf(stderr, "error: volume read failed at offset %llu (%lu)\n",
-                            diskOffset + done, GetLastError());
-                    return 1;
-                }
-                stream.Feed(chunk.data(), feed);
-                bytesRead += read;
-                done += feed;
-            }
-        }
-        streamed += runBytes;
-    }
+    std::vector<ParseContext> contexts;
+    ScanStats stats;
+    bool ok = StreamMft(volume, mftRuns, mftBytes, clusterSize, recordSize,
+                        threads, contexts, stats);
     CloseHandle(volume);
+    if (!ok) return 1;
+    MergeContexts(contexts);
+    contexts.clear(); // free per-thread arenas
+    contexts.shrink_to_fit();
 
     auto t1 = std::chrono::steady_clock::now();
-    double readSec =
+    double scanSec =
         std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1e6;
 
     // ---- 6. Aggregate folder sizes bottom-up -------------------------------
@@ -632,13 +959,13 @@ int wmain(int argc, wchar_t** argv) {
 
     // ---- Reporting ----------------------------------------------------------
     uint64_t fileCount = 0, dirCount = 0;
-    std::vector<uint32_t> files, dirs;
-    files.reserve(g_nodes.size());
+    TopLists top;
+    top.Files.reserve(g_nodes.size());
     for (uint32_t i = 0; i < g_nodes.size(); ++i) {
         const Node& n = g_nodes[i];
         if (!(n.Flags & kNodeInUse) || !(n.Flags & kNodeNamed)) continue;
-        if (n.Flags & kNodeIsDir) { ++dirCount; dirs.push_back(i); }
-        else                      { ++fileCount; files.push_back(i); }
+        if (n.Flags & kNodeIsDir) { ++dirCount; top.Dirs.push_back(i); }
+        else                      { ++fileCount; top.Files.push_back(i); }
     }
 
     auto byFileSize = [](uint32_t a, uint32_t b) {
@@ -647,67 +974,65 @@ int wmain(int argc, wchar_t** argv) {
     auto byDirSize = [&totals](uint32_t a, uint32_t b) {
         return totals[a].LogicalSize > totals[b].LogicalSize;
     };
-    size_t nf = std::min<size_t>(topN, files.size());
-    size_t nd = std::min<size_t>(topN, dirs.size());
-    std::partial_sort(files.begin(), files.begin() + nf, files.end(), byFileSize);
-    std::partial_sort(dirs.begin(),  dirs.begin() + nd,  dirs.end(),  byDirSize);
+    top.FileCount = std::min<size_t>(topN, top.Files.size());
+    top.DirCount  = std::min<size_t>(topN, top.Dirs.size());
+    std::partial_sort(top.Files.begin(), top.Files.begin() + top.FileCount,
+                      top.Files.end(), byFileSize);
+    std::partial_sort(top.Dirs.begin(), top.Dirs.begin() + top.DirCount,
+                      top.Dirs.end(), byDirSize);
 
     const DirTotals& root = totals[kRootRecord];
-    printf("\nScanned %llu records in %.2f s (MFT read %.2f s, %s @ %.0f MB/s)\n",
-           stream.RecordsParsed(), totalSec, readSec,
-           HumanSize(bytesRead).c_str(), bytesRead / readSec / (1024.0 * 1024.0));
+    printf("\nScanned %llu records in %.2f s (MFT streamed in %.2f s, %s @ %.0f MB/s)\n",
+           stats.RecordsParsed, totalSec, scanSec,
+           HumanSize(stats.BytesRead).c_str(),
+           stats.BytesRead / scanSec / (1024.0 * 1024.0));
     printf("Files: %llu   Folders: %llu   Total size: %s   On disk: %s\n",
            fileCount, dirCount,
            HumanSize(root.LogicalSize).c_str(),
            HumanSize(root.AllocatedSize).c_str());
 
-    printf("\n=== Top %zu folders by size ===\n", nd);
-    for (size_t i = 0; i < nd; ++i) {
-        uint32_t idx = dirs[i];
+    printf("\n=== Top %zu folders by size ===\n", top.DirCount);
+    for (size_t i = 0; i < top.DirCount; ++i) {
+        uint32_t idx = top.Dirs[i];
         printf("%12s  %9llu files  %s\n",
                HumanSize(totals[idx].LogicalSize).c_str(),
                totals[idx].FileCount,
                Utf8(BuildPath(idx, drive)).c_str());
     }
 
-    printf("\n=== Top %zu files by size ===\n", nf);
-    for (size_t i = 0; i < nf; ++i) {
-        uint32_t idx = files[i];
+    printf("\n=== Top %zu files by size ===\n", top.FileCount);
+    for (size_t i = 0; i < top.FileCount; ++i) {
+        uint32_t idx = top.Files[i];
         printf("%12s  %s\n",
                HumanSize(g_nodes[idx].LogicalSize).c_str(),
                Utf8(BuildPath(idx, drive)).c_str());
     }
 
-    // ---- Optional CSV export ------------------------------------------------
+    // ---- Export -------------------------------------------------------------
+    ChildIndex childIndex;
+    if (exportAll && (!csvPath.empty() || !jsonPath.empty()))
+        childIndex = BuildChildIndex(totals);
+    const ChildIndex* tree = exportAll ? &childIndex : nullptr;
+
+    auto openOut = [](const std::wstring& path) {
+        FILE* f = _wfopen(path.c_str(), L"wb");
+        if (f) setvbuf(f, nullptr, _IOFBF, 1 << 20); // big buffer: millions of rows
+        else fprintf(stderr, "error: cannot write %ls\n", path.c_str());
+        return f;
+    };
     if (!csvPath.empty()) {
-        FILE* f = _wfopen(csvPath.c_str(), L"wb");
-        if (!f) {
-            fprintf(stderr, "error: cannot write %ls\n", csvPath.c_str());
-            return 1;
-        }
-        fputs("\xEF\xBB\xBF", f); // UTF-8 BOM so Excel decodes correctly
-        fputs("type,path,size_bytes,allocated_bytes,files,folders\n", f);
-        auto csvEscape = [](std::string s) {
-            if (s.find_first_of(",\"") == std::string::npos) return s;
-            std::string out = "\"";
-            for (char c : s) { if (c == '"') out += '"'; out += c; }
-            return out + "\"";
-        };
-        for (size_t i = 0; i < nd; ++i) {
-            uint32_t idx = dirs[i];
-            fprintf(f, "folder,%s,%llu,%llu,%llu,%llu\n",
-                    csvEscape(Utf8(BuildPath(idx, drive))).c_str(),
-                    totals[idx].LogicalSize, totals[idx].AllocatedSize,
-                    totals[idx].FileCount, totals[idx].DirCount);
-        }
-        for (size_t i = 0; i < nf; ++i) {
-            uint32_t idx = files[i];
-            fprintf(f, "file,%s,%llu,%llu,,\n",
-                    csvEscape(Utf8(BuildPath(idx, drive))).c_str(),
-                    g_nodes[idx].LogicalSize, g_nodes[idx].AllocatedSize);
-        }
-        fclose(f);
-        printf("\nCSV written to %ls\n", csvPath.c_str());
+        if (FILE* f = openOut(csvPath)) {
+            ExportCsv(f, drive, top, totals, tree);
+            fclose(f);
+            printf("\nCSV written to %ls\n", csvPath.c_str());
+        } else return 1;
+    }
+    if (!jsonPath.empty()) {
+        if (FILE* f = openOut(jsonPath)) {
+            ExportJson(f, drive, top, totals, fileCount, dirCount, tree);
+            fclose(f);
+            printf("JSON written to %ls\n", jsonPath.c_str());
+        } else return 1;
     }
 
     return 0;

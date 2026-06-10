@@ -8,10 +8,11 @@
 - [x] In-memory tree from parent references, bottom-up folder aggregation
 - [x] Top-N folders/files report with timing stats
 - [x] CSV export (top-N lists)
-- [ ] JSON export
-- [ ] Full-tree export (every file/folder, not just top-N)
-- [ ] Multi-threaded record parsing (split MFT buffer across cores; overlap
-      parse with I/O — should roughly halve the ~5 s scan)
+- [x] JSON export (`--json out.json`)
+- [x] Full-tree export (`--all`: CSV gets one row per file/folder, JSON gets
+      a nested `tree` object with children sorted by size)
+- [x] Multi-threaded record parsing (reader thread streams the MFT while a
+      worker pool parses; scan is now bounded by raw volume read speed)
 - [ ] Scan multiple/all fixed volumes in one run
 - [ ] Progress reporting during the read (percent of MFT streamed)
 
