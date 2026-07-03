@@ -64,6 +64,11 @@
 - [x] Treemap cushion shading (toggleable pillow gradient per file rect)
 - [x] File-type coloring in the tree (names tinted with the same extension
       hue the treemap uses; shell icons deliberately skipped)
+- [x] Flat "Files" view: the largest files anywhere on the volume in one
+      sortable, filterable list (WizTree-style), independent of the folder
+      tree, virtualized so millions of rows stay smooth
+- [x] "File Types" view: space grouped by extension (size, count, percent of
+      volume), click a row to filter every view to that type
 
 ## Phase 3 — Polish
 

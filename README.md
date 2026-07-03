@@ -50,6 +50,14 @@ Launch `yadua-gui.exe` (it requests elevation itself), pick a drive, hit Scan.
   extensions, and sizes: `setup *.iso >100mb`. A docked treemap panel sits
   below the tree (resizable splitter, "Map panel" toggle); zoom and
   selection stay in sync with the full-screen Treemap tab.
+- **Files tab** — a flat, sortable list of the largest files anywhere on the
+  volume (WizTree-style), ignoring the folder hierarchy, with a per-file
+  percent-of-volume bar and the containing folder. Honors the same filter
+  box, so `*.iso >100mb` narrows it instantly; right-click gives the full
+  context menu (delete, reveal, properties, ...).
+- **File Types tab** — space grouped by extension: total size, file count,
+  and percent of the volume, largest first, each with the extension's color
+  swatch. Click a row to filter every view to that type.
 - **Treemap tab** — WinDirStat-style squarified treemap colored by file
   extension, with toggleable cushion shading. Hover for details,
   double-click to zoom into a folder, Up/Top to zoom out.

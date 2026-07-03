@@ -1,8 +1,10 @@
 // ============================================================================
 // YADUA GUI frontend — Dear ImGui (Win32 + DirectX 11).
 //
-// Views: a size-sorted tree table (sortable columns, name filter) and a
-// WinDirStat-style squarified treemap (src/treemap.*), in tabs.
+// Views (tabs): a size-sorted tree table (sortable columns, name filter), a
+// flat "Files" list of the largest files anywhere on the volume, a "File
+// Types" summary grouping space by extension, and a WinDirStat-style
+// squarified treemap (src/treemap.*). All four share the one filter box.
 //
 // The scan runs on a background thread (see scanner.h); the UI polls a
 // ScanProgress while it runs and takes ownership of the ScanResult when done.
@@ -26,6 +28,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "imgui.h"
@@ -75,6 +78,20 @@ struct App {
     // any other order lives in SortedChildren (parallel to Children.List).
     std::vector<uint32_t> SortedChildren;
     bool                  UseSorted = false;
+
+    // Flat "Files" view (WizTree-style largest-files list, ignoring folder
+    // structure) and "File Types" summary (space grouped by extension). Both
+    // are derived from the current filter and cached until it changes;
+    // RecomputeFilter marks them dirty. Rebuilt lazily when their tab draws.
+    std::vector<uint32_t> FileList;                 // file node indices, sorted
+    uint64_t              FileListBytes = 0;        // total size of FileList
+    bool                  FileListDirty = true;
+    ImGuiID               FileSortCol   = ColSize;  // active sort column
+    bool                  FileSortAsc   = false;
+    struct TypeAgg { std::wstring Ext; uint64_t Bytes = 0; uint64_t Count = 0; };
+    std::vector<TypeAgg>  TypeList;                 // by extension, size-desc
+    bool                  TypeListDirty = true;
+    bool                  SwitchToFiles = false;    // File Types row -> Files tab
 
     TreemapView Treemap;
     // Treemap panel docked under the tree (the Treemap tab still offers the
@@ -217,6 +234,8 @@ static std::vector<FilterTerm> ParseFilter(const char* utf8) {
 // matches all terms, then mark all its ancestors so the tree path down to
 // each match stays visible.
 static void RecomputeFilter(App& app) {
+    app.FileListDirty = true; // the flat Files / File Types views derive from it
+    app.TypeListDirty = true;
     const yadua::ScanResult* r = app.Result.get();
     std::vector<FilterTerm> terms = r ? ParseFilter(app.Filter)
                                       : std::vector<FilterTerm>{};
@@ -675,6 +694,248 @@ static void DrawTreeTab(App& app, const yadua::ScanResult& r) {
 }
 
 // ============================================================================
+// Files view (flat largest-files list) + File Types (extension summary)
+//
+// Both ignore the folder hierarchy: the Files tab is "where are the big files
+// on this volume, wherever they live", the File Types tab is "which kinds of
+// files eat the space". They honor the same filter box as the tree.
+// ============================================================================
+
+// Lowercased extension (chars after the last dot), or empty for "no type".
+// Mirrors the treemap's rule so a file lands in the same bucket/hue it is
+// colored with elsewhere: a dot must exist and the tail be at most 8 chars.
+static std::wstring FileExt(const yadua::ScanResult& r, uint32_t idx) {
+    std::wstring name = r.Name(idx);
+    size_t dot = name.find_last_of(L'.');
+    if (dot == std::wstring::npos || name.size() - dot > 9)
+        return std::wstring();
+    std::wstring ext = name.substr(dot + 1);
+    for (wchar_t& c : ext) c = towlower(c);
+    return ext;
+}
+
+// FNV-1a hue over a bare (already-lowercased) extension, matching the FNV the
+// treemap/tree use so a given type reads the same color across every view.
+static ImU32 ExtHueColor(const std::wstring& ext, float sat, float val) {
+    uint32_t h = 2166136261u;
+    if (!ext.empty() && ext.size() <= 8)
+        for (wchar_t c : ext) h = (h ^ (uint32_t)c) * 16777619u;
+    float hue = (float)(h % 360u) / 360.0f;
+    return ImColor(ImColor::HSV(hue, sat, val));
+}
+
+static void SortFileList(App& app) {
+    const yadua::ScanResult& r = *app.Result;
+    bool asc = app.FileSortAsc;
+    if (app.FileSortCol == ColName)
+        std::sort(app.FileList.begin(), app.FileList.end(),
+                  [&](uint32_t a, uint32_t b) {
+                      int c = CompareNames(r, a, b);
+                      return asc ? c < 0 : c > 0;
+                  });
+    else // ColSize (also the % column, which ranks by size)
+        std::sort(app.FileList.begin(), app.FileList.end(),
+                  [&](uint32_t a, uint32_t b) {
+                      uint64_t sa = r.Nodes[a].LogicalSize;
+                      uint64_t sb = r.Nodes[b].LogicalSize;
+                      if (sa != sb) return asc ? sa < sb : sa > sb;
+                      return CompareNames(r, a, b) < 0; // stable-ish tiebreak
+                  });
+}
+
+// Collect every file (directories excluded) that passes the current filter.
+static void RebuildFileList(App& app) {
+    const yadua::ScanResult& r = *app.Result;
+    const bool filtered = !app.Visible.empty();
+    app.FileList.clear();
+    app.FileListBytes = 0;
+    for (uint32_t i = 0; i < r.Nodes.size(); ++i) {
+        if (!r.Exists(i) || r.IsDir(i)) continue;
+        if (filtered && !app.Visible[i]) continue;
+        app.FileList.push_back(i);
+        app.FileListBytes += r.Nodes[i].LogicalSize;
+    }
+    SortFileList(app);
+    app.FileListDirty = false;
+}
+
+static void DrawFilesTab(App& app, const yadua::ScanResult& r) {
+    if (app.FileListDirty) RebuildFileList(app);
+    uint64_t volTotal = r.Totals[yadua::kRootRecord].LogicalSize;
+
+    ImGui::TextDisabled("%zu files, %s total%s", app.FileList.size(),
+                        yadua::HumanSize(app.FileListBytes).c_str(),
+                        app.Visible.empty() ? "" : "  (filtered)");
+
+    if (!ImGui::BeginTable("files", 4,
+                           ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg |
+                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
+                           ImGuiTableFlags_Sortable))
+        return;
+    float ch = ImGui::GetFontSize();
+    ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 0, ColName);
+    ImGui::TableSetupColumn("Size",
+                            ImGuiTableColumnFlags_WidthFixed |
+                            ImGuiTableColumnFlags_DefaultSort |
+                            ImGuiTableColumnFlags_PreferSortDescending,
+                            ch * 6, ColSize);
+    ImGui::TableSetupColumn("% of volume",
+                            ImGuiTableColumnFlags_WidthFixed |
+                            ImGuiTableColumnFlags_NoSort, ch * 8, ColPercent);
+    ImGui::TableSetupColumn("Folder",
+                            ImGuiTableColumnFlags_WidthStretch |
+                            ImGuiTableColumnFlags_NoSort, 0, ColFolders);
+    ImGui::TableSetupScrollFreeze(0, 1);
+    ImGui::TableHeadersRow();
+
+    if (ImGuiTableSortSpecs* specs = ImGui::TableGetSortSpecs();
+        specs && specs->SpecsDirty) {
+        if (specs->SpecsCount > 0) {
+            app.FileSortCol = specs->Specs[0].ColumnUserID;
+            app.FileSortAsc =
+                specs->Specs[0].SortDirection == ImGuiSortDirection_Ascending;
+            SortFileList(app);
+        }
+        specs->SpecsDirty = false;
+    }
+
+    // Millions of files are possible, so only the visible rows are laid out.
+    ImGuiListClipper clipper;
+    clipper.Begin((int)app.FileList.size());
+    while (clipper.Step()) {
+        for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+            uint32_t idx = app.FileList[row];
+            ImGui::TableNextRow();
+            ImGui::PushID((int)idx);
+
+            ImGui::TableSetColumnIndex(0);
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                                  ExtensionColor(r, idx, 0.40f, 0.95f));
+            if (ImGui::Selectable(yadua::Utf8(r.Name(idx)).c_str(),
+                                  idx == app.SelectedNode,
+                                  ImGuiSelectableFlags_SpanAllColumns))
+                app.SelectedNode = idx;
+            ImGui::PopStyleColor();
+            if (ImGui::BeginPopupContextItem()) {
+                app.SelectedNode = idx;
+                NodeMenuItems(app, r, idx, false);
+                ImGui::EndPopup();
+            }
+
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextUnformatted(
+                yadua::HumanSize(r.Nodes[idx].LogicalSize).c_str());
+
+            ImGui::TableSetColumnIndex(2);
+            float frac = volTotal
+                ? (float)((double)r.Nodes[idx].LogicalSize / (double)volTotal)
+                : 0.0f;
+            char overlay[16];
+            snprintf(overlay, sizeof(overlay), "%.2f%%", frac * 100.0);
+            ImGui::ProgressBar(frac, ImVec2(-FLT_MIN, 0.0f), overlay);
+
+            ImGui::TableSetColumnIndex(3);
+            ImGui::TextUnformatted(
+                yadua::Utf8(r.Path(r.Nodes[idx].Parent)).c_str());
+
+            ImGui::PopID();
+        }
+    }
+    ImGui::EndTable();
+}
+
+// Aggregate every filtered file by extension into a size-descending table.
+static void RebuildTypeList(App& app) {
+    const yadua::ScanResult& r = *app.Result;
+    const bool filtered = !app.Visible.empty();
+    std::unordered_map<std::wstring, App::TypeAgg> agg;
+    for (uint32_t i = 0; i < r.Nodes.size(); ++i) {
+        if (!r.Exists(i) || r.IsDir(i)) continue;
+        if (filtered && !app.Visible[i]) continue;
+        std::wstring ext = FileExt(r, i);
+        App::TypeAgg& a = agg[ext];
+        a.Ext    = ext;
+        a.Bytes += r.Nodes[i].LogicalSize;
+        a.Count += 1;
+    }
+    app.TypeList.clear();
+    app.TypeList.reserve(agg.size());
+    for (auto& kv : agg) app.TypeList.push_back(std::move(kv.second));
+    std::sort(app.TypeList.begin(), app.TypeList.end(),
+              [](const App::TypeAgg& a, const App::TypeAgg& b) {
+                  return a.Bytes > b.Bytes;
+              });
+    app.TypeListDirty = false;
+}
+
+static void DrawTypesTab(App& app, const yadua::ScanResult& r) {
+    if (app.TypeListDirty) RebuildTypeList(app);
+    uint64_t volTotal = r.Totals[yadua::kRootRecord].LogicalSize;
+
+    ImGui::TextDisabled("%zu file types%s  -  click a row to filter to it",
+                        app.TypeList.size(),
+                        app.Visible.empty() ? "" : "  (filtered)");
+
+    if (!ImGui::BeginTable("types", 4,
+                           ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg |
+                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable))
+        return;
+    float ch = ImGui::GetFontSize();
+    ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthStretch);
+    ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, ch * 6);
+    ImGui::TableSetupColumn("Files", ImGuiTableColumnFlags_WidthFixed, ch * 6);
+    ImGui::TableSetupColumn("% of volume",
+                            ImGuiTableColumnFlags_WidthFixed, ch * 8);
+    ImGui::TableSetupScrollFreeze(0, 1);
+    ImGui::TableHeadersRow();
+
+    ImGuiListClipper clipper;
+    clipper.Begin((int)app.TypeList.size());
+    while (clipper.Step()) {
+        for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+            const App::TypeAgg& t = app.TypeList[row];
+            ImGui::TableNextRow();
+            ImGui::PushID(row);
+
+            ImGui::TableSetColumnIndex(0);
+            ImVec2 p = ImGui::GetCursorScreenPos();
+            float lh = ImGui::GetTextLineHeight();
+            float sq = lh * 0.72f;
+            ImGui::GetWindowDrawList()->AddRectFilled(
+                ImVec2(p.x, p.y + (lh - sq) * 0.5f),
+                ImVec2(p.x + sq, p.y + (lh - sq) * 0.5f + sq),
+                ExtHueColor(t.Ext, 0.55f, 0.80f), 2.0f);
+            ImGui::SetCursorScreenPos(
+                ImVec2(p.x + sq + ImGui::GetStyle().ItemInnerSpacing.x, p.y));
+            std::string label = t.Ext.empty() ? std::string("(no extension)")
+                                              : "." + yadua::Utf8(t.Ext);
+            if (ImGui::Selectable(label.c_str()) && !t.Ext.empty()) {
+                snprintf(app.Filter, sizeof(app.Filter), "*.%s",
+                         yadua::Utf8(t.Ext).c_str());
+                RecomputeFilter(app);
+                app.SwitchToFiles = true;
+            }
+
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextUnformatted(yadua::HumanSize(t.Bytes).c_str());
+
+            ImGui::TableSetColumnIndex(2);
+            ImGui::Text("%llu", (unsigned long long)t.Count);
+
+            ImGui::TableSetColumnIndex(3);
+            float frac = volTotal ? (float)((double)t.Bytes / (double)volTotal)
+                                  : 0.0f;
+            char overlay[16];
+            snprintf(overlay, sizeof(overlay), "%.2f%%", frac * 100.0);
+            ImGui::ProgressBar(frac, ImVec2(-FLT_MIN, 0.0f), overlay);
+
+            ImGui::PopID();
+        }
+    }
+    ImGui::EndTable();
+}
+
+// ============================================================================
 // Top-level UI
 // ============================================================================
 
@@ -808,6 +1069,17 @@ static void DrawUi(App& app) {
                                         ? ImGuiTabItemFlags_SetSelected : 0)) {
                 app.SwitchToTree = false;
                 DrawTreeTab(app, *app.Result);
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Files", nullptr,
+                                    app.SwitchToFiles
+                                        ? ImGuiTabItemFlags_SetSelected : 0)) {
+                app.SwitchToFiles = false;
+                DrawFilesTab(app, *app.Result);
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("File Types")) {
+                DrawTypesTab(app, *app.Result);
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Treemap", nullptr,
@@ -958,7 +1230,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
                       L"YADUA", icon};
     RegisterClassExW(&wc);
     HWND hwnd = CreateWindowW(wc.lpszClassName,
-                              L"YADUA — Yet Another Disk Usage Analyzer",
+                              L"YADUA - Yet Another Disk Usage Analyzer",
                               WS_OVERLAPPEDWINDOW, 100, 100, 1280, 800,
                               nullptr, nullptr, instance, nullptr);
     if (!CreateDeviceD3D(hwnd)) {
