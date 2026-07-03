@@ -214,6 +214,10 @@ struct App {
     // show used / free / total, and the treemap can reserve a free-space slice.
     uint64_t            VolTotalBytes = 0;
     uint64_t            VolFreeBytes  = 0;
+
+    // User-defined right-click commands from %LOCALAPPDATA%\YADUA\commands.txt,
+    // each "Label|command line" where %1 is replaced with the selected path.
+    std::vector<std::pair<std::wstring, std::wstring>> UserCommands;
 };
 
 // All fixed drives: NTFS gets the fast MFT scan, anything else (or a
@@ -619,6 +623,74 @@ static void SaveSettings(App& app) {
     fclose(f);
 }
 
+// Load user-defined right-click commands from %LOCALAPPDATA%\YADUA\commands.txt.
+// Each line is "Label|command line"; %1 in the command is replaced with the
+// selected path (quoted). On first run a commented template is written so the
+// format is discoverable.
+static void LoadUserCommands(App& app) {
+    std::wstring dir = SettingsPath();
+    if (dir.empty()) return;
+    dir.resize(dir.find_last_of(L'\\')); // drop "settings.txt"
+    std::wstring path = dir + L"\\commands.txt";
+
+    FILE* f = _wfopen(path.c_str(), L"rb");
+    if (!f) {
+        // First run: drop a template so the feature is discoverable.
+        f = _wfopen(path.c_str(), L"wb");
+        if (f) {
+            fputs("# YADUA right-click commands - one per line: Label|command\n"
+                  "# %1 becomes the selected file/folder path (quoted); if a\n"
+                  "# line has no %1 the path is appended. Lines with # are\n"
+                  "# ignored. Uncomment/add your own:\n"
+                  "#Open in VS Code|code \"%1\"\n"
+                  "#PowerShell here|powershell -NoExit -Command \"Set-Location "
+                  "-LiteralPath '%1'\"\n"
+                  "#SHA-256|powershell -NoExit -Command \"Get-FileHash "
+                  "-LiteralPath '%1'\"\n", f);
+            fclose(f);
+        }
+        return;
+    }
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        std::string s(line);
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+        if (s.empty() || s[0] == '#') continue;
+        size_t bar = s.find('|');
+        if (bar == std::string::npos || bar == 0) continue;
+        app.UserCommands.emplace_back(yadua::Wide(s.substr(0, bar)),
+                                      yadua::Wide(s.substr(bar + 1)));
+    }
+    fclose(f);
+}
+
+// Run a user command with %1 replaced by the (quoted) path; working directory
+// is the item's folder. Uses CreateProcess so a full command line with args
+// works without a shell.
+static void RunUserCommand(const std::wstring& cmdTemplate,
+                           const std::wstring& path) {
+    std::wstring cmd = cmdTemplate;
+    std::wstring quoted = L"\"" + path + L"\"";
+    size_t pos = cmd.find(L"%1");
+    if (pos != std::wstring::npos) cmd.replace(pos, 2, quoted);
+    else cmd += L" " + quoted;
+
+    std::wstring dir = path;
+    size_t slash = dir.find_last_of(L'\\');
+    if (slash != std::wstring::npos) dir.resize(slash);
+
+    std::vector<wchar_t> buf(cmd.begin(), cmd.end());
+    buf.push_back(0); // CreateProcessW may modify the command-line buffer
+    STARTUPINFOW si{sizeof(si)};
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessW(nullptr, buf.data(), nullptr, nullptr, FALSE,
+                       CREATE_NEW_PROCESS_GROUP, nullptr,
+                       dir.empty() ? nullptr : dir.c_str(), &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+}
+
 static void StartUpdateCheck(App& app, bool manual) {
     if (app.UpdChecking || app.UpdDownloading || !yadua::UpdaterConfigured())
         return;
@@ -717,6 +789,13 @@ static void NodeMenuItems(App& app, const yadua::ScanResult& r, uint32_t idx,
         sei.lpFile = path.c_str();
         sei.nShow  = SW_SHOW;
         ShellExecuteExW(&sei);
+    }
+    // User-defined commands (commands.txt), run against this item's path.
+    if (!app.UserCommands.empty() && ImGui::BeginMenu("Commands")) {
+        for (const auto& c : app.UserCommands)
+            if (ImGui::MenuItem(yadua::Utf8(c.first).c_str()))
+                RunUserCommand(c.second, r.Path(idx));
+        ImGui::EndMenu();
     }
     ImGui::Separator();
     ImGui::BeginDisabled(idx == (uint32_t)yadua::kRootRecord || app.Deleting);
@@ -1975,6 +2054,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
     App app;
     ListFixedDrives(app);
     LoadSettings(app);
+    LoadUserCommands(app);
     // Restore the last-scanned drive.
     if (!app.LastDrive.empty())
         for (int i = 0; i < (int)app.Drives.size(); ++i)

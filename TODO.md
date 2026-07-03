@@ -155,5 +155,7 @@
       in CSV exports. (Owner column deferred - needs per-file security lookups.)
 - [ ] **In-GUI compare/history** view over snapshots (the CLI already does
       `--snapshot` / `--diff`; surface it in the UI)
-- [ ] **Custom "open with" / user commands** on a selection (WinDirStat's
-      configurable cleanup actions)
+- [x] **Custom right-click commands** (WinDirStat-style cleanup actions):
+      `%LOCALAPPDATA%\YADUA\commands.txt` holds "Label|command" lines (%1 = the
+      selected path); they appear under a "Commands" submenu and run via
+      CreateProcess. A commented template is written on first run.
