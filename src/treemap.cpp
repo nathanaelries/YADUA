@@ -29,19 +29,23 @@ uint32_t ExtensionHash(const ScanResult& r, uint32_t node) {
     return h;
 }
 
-// Treemap fill: extension hue with a little brightness variation.
+// Treemap fill: extension hue, vivid enough that neighbouring types read as
+// distinct colors (not washed-out grey), with per-hash saturation + brightness
+// jitter so two files that happen to share a hue still differ in shade.
 ImU32 FileColor(const ScanResult& r, uint32_t node) {
     uint32_t h = ExtensionHash(r, node);
     float hue = (float)(h % 360u) / 360.0f;
-    float val = 0.62f + (float)((h >> 9) % 25u) / 100.0f;
-    ImVec4 c = ImColor::HSV(hue, 0.55f, val);
-    return ImColor(c);
+    float sat = 0.70f + (float)((h >> 17) % 20u) / 100.0f; // 0.70 - 0.89
+    float val = 0.75f + (float)((h >> 9) % 22u) / 100.0f;  // 0.75 - 0.96
+    return ImColor(ImColor::HSV(hue, sat, val));
 }
 
 constexpr ImU32 kDirFill    = IM_COL32(36, 37, 44, 255);
 constexpr ImU32 kDirBorder  = IM_COL32(80, 82, 95, 255);
 constexpr ImU32 kRestFill   = IM_COL32(70, 71, 78, 255);
-constexpr ImU32 kFileBorder = IM_COL32(0, 0, 0, 110);
+// A faint pure-white hairline between file rects so adjacent similar hues stay
+// visually separable (the "which is which" problem).
+constexpr ImU32 kFileBorder = IM_COL32(255, 255, 255, 55);
 
 // Worst aspect ratio of a row of areas laid along a side of length `side`.
 // Lower is better (1.0 = all squares). From the squarified-treemap paper.
