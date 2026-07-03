@@ -47,10 +47,13 @@ Launch `yadua-gui.exe` (it requests elevation itself), pick a drive, hit Scan.
 A standard menu bar (**File / Edit / View / Search / Tools / Help**) exposes
 every action; the toolbar keeps just the drive picker, Scan, and the filter
 box. Keyboard: `Ctrl+R` scan, `Ctrl+F` find, `Del` recycle the selection,
-`Esc` clear the filter.
+`Esc` clear the filter. **File ▸ Export** writes the full tree or the current
+file list to CSV (on a background thread, so a big volume won't stall the UI).
+The window position/size and last-scanned drive are remembered between runs.
 
 - **Tree tab** — sortable, reorderable columns (Name, Size, % of parent,
-  Files, Folders, Modified — click a header to sort, drag to reorder),
+  Files, Folders, Modified, and an optional Allocated column — click a header
+  to sort, drag to reorder, right-click a header to show/hide columns),
   percent-of-parent bars, filter box that auto-expands to matches. Filters
   combine name terms, extensions, and sizes: `setup *.iso >100mb`. A docked
   treemap panel sits below the tree (resizable splitter, toggle in *View ▸

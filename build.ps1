@@ -59,7 +59,7 @@ $gui = "cl $common /W3 /DUNICODE /D_UNICODE /I`"$imgui`" /I`"$imgui\backends`" $
        " /link /SUBSYSTEM:WINDOWS" +
        " /MANIFEST:EMBED /MANIFESTUAC:level='requireAdministrator'" +
        " d3d11.lib d3dcompiler.lib dxgi.lib user32.lib gdi32.lib shell32.lib ole32.lib" +
-       " winhttp.lib bcrypt.lib version.lib"
+       " winhttp.lib bcrypt.lib version.lib comdlg32.lib"
 
 cmd /c "`"$vcvars`" $vcArch >nul 2>&1 && $res && $cli && $gui"
 if ($LASTEXITCODE -ne 0) { throw "Build failed." }

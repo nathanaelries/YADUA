@@ -130,13 +130,16 @@
       sortable, reorderable "Modified" column now appears in the Tree and
       Files views; the snapshot format bumped to v2 (v1 still loads); CSV/JSON
       exports gained a `modified` field. (created/accessed times not surfaced.)
-- [ ] **Export from the GUI** (File ▸ Export): dump the current tree or the
-      Files list to CSV/JSON, reusing the CLI's export code path. WizTree
-      exports from its UI; today YADUA only exports from the console.
+- [x] **Export from the GUI** (File ▸ Export): full tree or the current
+      (filtered) file list to CSV, written on a background thread so a big
+      volume can't freeze the UI. (JSON still CLI-only.)
 - [ ] **Scan a specific folder / path**, not just a whole volume (File ▸ Scan
       folder...), via the directory-walk scanner rooted at the chosen path
-- [ ] **Allocated column alongside Size**, plus show/hide + reorder columns
-      (WizTree and WinDirStat both let you pick columns)
+- [x] **Allocated column alongside Size**, plus show/hide + reorder columns:
+      an "Allocated" column (hidden by default) in the Tree and Files views,
+      right-click a header to show/hide, drag to reorder
+- [x] **Remember window size/position and the last-scanned drive** across runs
+      (persisted in the settings file)
 - [ ] **Multi-select** in the tree and Files list for bulk delete / export
 - [ ] **Free / unused space** surfaced in the totals and as a slice in the
       treemap (WizTree shows free space and MFT/overhead)
@@ -145,4 +148,3 @@
       `--snapshot` / `--diff`; surface it in the UI)
 - [ ] **Custom "open with" / user commands** on a selection (WinDirStat's
       configurable cleanup actions)
-- [ ] Remember window size/position and the last-scanned drive across runs

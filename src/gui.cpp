@@ -18,12 +18,14 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <commdlg.h>
 #include <d3d11.h>
 #include <shellapi.h>
 #include <objbase.h>
 
 #include <algorithm>
 #include <atomic>
+#include <climits>
 #include <cstdio>
 #include <cwctype>
 #include <memory>
@@ -44,7 +46,8 @@
 // ============================================================================
 
 enum TreeColumn : ImGuiID {
-    ColName = 0, ColSize, ColPercent, ColFiles, ColFolders, ColModified
+    ColName = 0, ColSize, ColPercent, ColFiles, ColFolders, ColModified,
+    ColAllocated
 };
 
 // A FILETIME (100 ns since 1601 UTC) as a local "YYYY-MM-DD HH:MM" string;
@@ -178,6 +181,20 @@ struct App {
     yadua::ScanProgress UpdProgress;
     std::wstring        UpdInstallerPath;         // verified installer, when ready
     std::wstring        UpdDownloadError;
+
+    // ---- Export (File > Export), on a background thread so a big tree can't
+    // freeze the UI while it writes. ----------------------------------------
+    bool                Exporting = false;
+    std::atomic<bool>   ExportDone{false};
+    std::thread         ExportThread;
+    int                 ExportKind = 0;            // 0 = full tree, 1 = file list
+    std::wstring        ExportPath;                // chosen file
+    std::wstring        ExportError;               // empty = ok
+
+    // ---- Persisted window placement + last drive --------------------------
+    HWND                MainWindow = nullptr;
+    int                 WinX = INT_MIN, WinY = INT_MIN, WinW = 0, WinH = 0;
+    std::wstring        LastDrive;                 // e.g. L"C:"
 };
 
 // All fixed drives: NTFS gets the fast MFT scan, anything else (or a
@@ -194,7 +211,8 @@ static void ListFixedDrives(App& app) {
 }
 
 static void StartScan(App& app) {
-    if (app.Scanning || app.Deleting || app.Rescanning || app.Drives.empty())
+    if (app.Scanning || app.Deleting || app.Rescanning || app.Exporting ||
+        app.Drives.empty())
         return;
     if (app.ScanThread.joinable()) app.ScanThread.join();
     app.Pending = std::make_unique<yadua::ScanResult>();
@@ -358,10 +376,12 @@ static void ApplySort(App& app, const ImGuiTableColumnSortSpecs& spec) {
     app.SortedChildren = r.Children.List;
     auto key = [&](uint32_t n) -> uint64_t {
         switch (spec.ColumnUserID) {
-            case ColFiles:    return r.IsDir(n) ? r.Totals[n].FileCount : 0;
-            case ColFolders:  return r.IsDir(n) ? r.Totals[n].DirCount : 0;
-            case ColModified: return r.Nodes[n].ModifiedTime;
-            default:          return r.SizeOf(n); // ColSize / ColPercent
+            case ColFiles:     return r.IsDir(n) ? r.Totals[n].FileCount : 0;
+            case ColFolders:   return r.IsDir(n) ? r.Totals[n].DirCount : 0;
+            case ColModified:  return r.Nodes[n].ModifiedTime;
+            case ColAllocated: return r.IsDir(n) ? r.Totals[n].AllocatedSize
+                                                 : r.Nodes[n].AllocatedSize;
+            default:           return r.SizeOf(n); // ColSize / ColPercent
         }
     };
     for (size_t d = 0; d + 1 < r.Children.Offset.size(); ++d) {
@@ -385,7 +405,8 @@ static void ApplySort(App& app, const ImGuiTableColumnSortSpecs& spec) {
 // ============================================================================
 
 static void StartRescan(App& app, uint32_t node) {
-    if (app.Rescanning || app.Scanning || app.Deleting || !app.Result)
+    if (app.Rescanning || app.Scanning || app.Deleting || app.Exporting ||
+        !app.Result)
         return;
     if (app.RescanThread.joinable()) app.RescanThread.join();
     app.RescanPath  = app.Result->Path(node);
@@ -401,7 +422,8 @@ static void StartRescan(App& app, uint32_t node) {
 }
 
 static void StartDelete(App& app, uint32_t node) {
-    if (app.Deleting || app.Scanning || app.Rescanning || !app.Result)
+    if (app.Deleting || app.Scanning || app.Rescanning || app.Exporting ||
+        !app.Result)
         return;
     if (app.DeleteThread.joinable()) app.DeleteThread.join();
     app.DeleteNode   = node;
@@ -519,6 +541,10 @@ static void LoadSettings(App& app) {
         if (key == "checkOnLaunch")       app.UpdCheckOnLaunch = (val != "0");
         else if (key == "skip")           app.UpdSkipVersion = yadua::Wide(val);
         else if (key == "showAllocated")  app.ShowAllocated = (val != "0");
+        else if (key == "drive")          app.LastDrive = yadua::Wide(val);
+        else if (key == "win")
+            sscanf(val.c_str(), "%d,%d,%d,%d", &app.WinX, &app.WinY, &app.WinW,
+                   &app.WinH);
     }
     fclose(f);
 }
@@ -531,6 +557,10 @@ static void SaveSettings(App& app) {
     fprintf(f, "checkOnLaunch=%d\n", app.UpdCheckOnLaunch ? 1 : 0);
     fprintf(f, "skip=%s\n", yadua::Utf8(app.UpdSkipVersion).c_str());
     fprintf(f, "showAllocated=%d\n", app.ShowAllocated ? 1 : 0);
+    if (!app.LastDrive.empty())
+        fprintf(f, "drive=%s\n", yadua::Utf8(app.LastDrive).c_str());
+    if (app.WinW > 0 && app.WinH > 0)
+        fprintf(f, "win=%d,%d,%d,%d\n", app.WinX, app.WinY, app.WinW, app.WinH);
     fclose(f);
 }
 
@@ -705,6 +735,10 @@ static void DrawTree(App& app, const yadua::ScanResult& r, uint32_t idx,
     ImGui::TableNextColumn();
     ImGui::TextUnformatted(FormatTime(r.Nodes[idx].ModifiedTime).c_str());
 
+    ImGui::TableNextColumn();
+    ImGui::TextUnformatted(yadua::HumanSize(
+        isDir ? r.Totals[idx].AllocatedSize : r.Nodes[idx].AllocatedSize).c_str());
+
     if (open && !leaf) {
         const uint32_t* list = app.UseSorted ? app.SortedChildren.data()
                                              : r.Children.List.data();
@@ -739,10 +773,11 @@ static void DrawTree(App& app, const yadua::ScanResult& r, uint32_t idx,
 }
 
 static void DrawTreeTable(App& app, const yadua::ScanResult& r) {
-    if (!ImGui::BeginTable("tree", 6,
+    if (!ImGui::BeginTable("tree", 7,
                            ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg |
                            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
-                           ImGuiTableFlags_Reorderable | ImGuiTableFlags_Sortable))
+                           ImGuiTableFlags_Reorderable | ImGuiTableFlags_Hideable |
+                           ImGuiTableFlags_Sortable))
         return;
     float ch = ImGui::GetFontSize();
     ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 0, ColName);
@@ -766,6 +801,11 @@ static void DrawTreeTable(App& app, const yadua::ScanResult& r) {
                             ImGuiTableColumnFlags_WidthFixed |
                             ImGuiTableColumnFlags_PreferSortDescending,
                             ch * 9, ColModified);
+    ImGui::TableSetupColumn("Allocated",
+                            ImGuiTableColumnFlags_WidthFixed |
+                            ImGuiTableColumnFlags_DefaultHide |
+                            ImGuiTableColumnFlags_PreferSortDescending,
+                            ch * 6, ColAllocated);
     ImGui::TableSetupScrollFreeze(0, 1);
     ImGui::TableHeadersRow();
 
@@ -885,6 +925,14 @@ static void SortFileList(App& app) {
                       if (ma != mb) return asc ? ma < mb : ma > mb;
                       return CompareNames(r, a, b) < 0;
                   });
+    else if (app.FileSortCol == ColAllocated)
+        std::sort(app.FileList.begin(), app.FileList.end(),
+                  [&](uint32_t a, uint32_t b) {
+                      uint64_t aa = r.Nodes[a].AllocatedSize;
+                      uint64_t ab = r.Nodes[b].AllocatedSize;
+                      if (aa != ab) return asc ? aa < ab : aa > ab;
+                      return CompareNames(r, a, b) < 0;
+                  });
     else // ColSize (also the % column, which ranks by size)
         std::sort(app.FileList.begin(), app.FileList.end(),
                   [&](uint32_t a, uint32_t b) {
@@ -920,10 +968,11 @@ static void DrawFilesTab(App& app, const yadua::ScanResult& r) {
                         r.DisplayAllocated ? " on disk" : "",
                         app.Visible.empty() ? "" : "  (filtered)");
 
-    if (!ImGui::BeginTable("files", 5,
+    if (!ImGui::BeginTable("files", 6,
                            ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg |
                            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
-                           ImGuiTableFlags_Reorderable | ImGuiTableFlags_Sortable))
+                           ImGuiTableFlags_Reorderable | ImGuiTableFlags_Hideable |
+                           ImGuiTableFlags_Sortable))
         return;
     float ch = ImGui::GetFontSize();
     ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 0, ColName);
@@ -942,6 +991,11 @@ static void DrawFilesTab(App& app, const yadua::ScanResult& r) {
     ImGui::TableSetupColumn("Folder",
                             ImGuiTableColumnFlags_WidthStretch |
                             ImGuiTableColumnFlags_NoSort, 0, ColFolders);
+    ImGui::TableSetupColumn("Allocated",
+                            ImGuiTableColumnFlags_WidthFixed |
+                            ImGuiTableColumnFlags_DefaultHide |
+                            ImGuiTableColumnFlags_PreferSortDescending,
+                            ch * 6, ColAllocated);
     ImGui::TableSetupScrollFreeze(0, 1);
     ImGui::TableHeadersRow();
 
@@ -996,6 +1050,10 @@ static void DrawFilesTab(App& app, const yadua::ScanResult& r) {
             ImGui::TableSetColumnIndex(4);
             ImGui::TextUnformatted(
                 yadua::Utf8(r.Path(r.Nodes[idx].Parent)).c_str());
+
+            ImGui::TableSetColumnIndex(5);
+            ImGui::TextUnformatted(
+                yadua::HumanSize(r.Nodes[idx].AllocatedSize).c_str());
 
             ImGui::PopID();
         }
@@ -1095,6 +1153,128 @@ static void DrawTypesTab(App& app, const yadua::ScanResult& r) {
 }
 
 // ============================================================================
+// Export (CSV), on a background thread so a big tree can't freeze the UI
+// ============================================================================
+
+static std::string CsvEsc(const std::string& s) {
+    if (s.find_first_of(",\"\n") == std::string::npos) return s;
+    std::string out = "\"";
+    for (char c : s) { if (c == '"') out += '"'; out += c; }
+    return out + "\"";
+}
+
+// Full tree, one row per file/folder (same schema as the CLI's --all --csv).
+static bool WriteTreeCsv(const yadua::ScanResult& r, const std::wstring& path,
+                         std::wstring& err) {
+    FILE* f = _wfopen(path.c_str(), L"wb");
+    if (!f) { err = L"cannot create " + path; return false; }
+    setvbuf(f, nullptr, _IOFBF, 1 << 20);
+    fputs("\xEF\xBB\xBF", f); // UTF-8 BOM for Excel
+    fputs("type,path,size_bytes,allocated_bytes,files,folders,modified\n", f);
+    std::wstring cur = r.Drive;
+    std::function<void(uint32_t)> walk = [&](uint32_t idx) {
+        if (r.IsDir(idx)) {
+            fprintf(f, "folder,%s,%llu,%llu,%llu,%llu,%s\n",
+                    CsvEsc(yadua::Utf8(cur)).c_str(),
+                    (unsigned long long)r.Totals[idx].LogicalSize,
+                    (unsigned long long)r.Totals[idx].AllocatedSize,
+                    (unsigned long long)r.Totals[idx].FileCount,
+                    (unsigned long long)r.Totals[idx].DirCount,
+                    FormatTime(r.Nodes[idx].ModifiedTime).c_str());
+            for (uint32_t c = r.Children.Offset[idx];
+                 c < r.Children.Offset[idx + 1]; ++c) {
+                uint32_t child = r.Children.List[c];
+                if (!r.Exists(child)) continue;
+                size_t len = cur.size();
+                cur += L'\\';
+                cur += r.Name(child);
+                walk(child);
+                cur.resize(len);
+            }
+        } else {
+            fprintf(f, "file,%s,%llu,%llu,,,%s\n", CsvEsc(yadua::Utf8(cur)).c_str(),
+                    (unsigned long long)r.Nodes[idx].LogicalSize,
+                    (unsigned long long)r.Nodes[idx].AllocatedSize,
+                    FormatTime(r.Nodes[idx].ModifiedTime).c_str());
+        }
+    };
+    walk((uint32_t)yadua::kRootRecord);
+    bool ok = !ferror(f);
+    fclose(f);
+    if (!ok) err = L"write error on " + path;
+    return ok;
+}
+
+// The current Files view (already filtered + sorted): one row per file.
+static bool WriteFilesCsv(const yadua::ScanResult& r,
+                          const std::vector<uint32_t>& files,
+                          const std::wstring& path, std::wstring& err) {
+    FILE* f = _wfopen(path.c_str(), L"wb");
+    if (!f) { err = L"cannot create " + path; return false; }
+    setvbuf(f, nullptr, _IOFBF, 1 << 20);
+    fputs("\xEF\xBB\xBF", f);
+    fputs("name,size_bytes,allocated_bytes,modified,folder\n", f);
+    for (uint32_t idx : files) {
+        if (!r.Exists(idx)) continue;
+        fprintf(f, "%s,%llu,%llu,%s,%s\n",
+                CsvEsc(yadua::Utf8(r.Name(idx))).c_str(),
+                (unsigned long long)r.Nodes[idx].LogicalSize,
+                (unsigned long long)r.Nodes[idx].AllocatedSize,
+                FormatTime(r.Nodes[idx].ModifiedTime).c_str(),
+                CsvEsc(yadua::Utf8(r.Path(r.Nodes[idx].Parent))).c_str());
+    }
+    bool ok = !ferror(f);
+    fclose(f);
+    if (!ok) err = L"write error on " + path;
+    return ok;
+}
+
+// Standard Save-As dialog (runs on the UI thread). Returns false if cancelled.
+static bool SaveCsvDialog(HWND owner, const wchar_t* title,
+                          const wchar_t* defName, std::wstring& out) {
+    wchar_t buf[MAX_PATH];
+    wcsncpy_s(buf, defName, _TRUNCATE);
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner   = owner;
+    ofn.lpstrFilter = L"CSV files\0*.csv\0All files\0*.*\0";
+    ofn.lpstrFile   = buf;
+    ofn.nMaxFile    = MAX_PATH;
+    ofn.lpstrTitle  = title;
+    ofn.lpstrDefExt = L"csv";
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetSaveFileNameW(&ofn)) return false;
+    out = buf;
+    return true;
+}
+
+// kind 0 = full tree, 1 = the current (filtered) file list.
+static void StartExport(App& app, int kind, const std::wstring& path) {
+    if (app.Exporting || app.Scanning || app.Rescanning || app.Deleting ||
+        !app.Result)
+        return;
+    if (app.ExportThread.joinable()) app.ExportThread.join();
+    if (kind == 1 && app.FileListDirty) RebuildFileList(app);
+    app.ExportKind = kind;
+    app.ExportPath = path;
+    app.ExportError.clear();
+    app.ExportDone = false;
+    app.Exporting  = true;
+    // Snapshot the file list so the worker can't race a rebuild; the tree is
+    // only read (scans/deletes are blocked while exporting), so pass a pointer.
+    std::vector<uint32_t> files = kind == 1 ? app.FileList
+                                            : std::vector<uint32_t>{};
+    yadua::ScanResult* r = app.Result.get();
+    app.ExportThread = std::thread([&app, r, path, kind, files] {
+        std::wstring err;
+        bool ok = kind == 1 ? WriteFilesCsv(*r, files, path, err)
+                            : WriteTreeCsv(*r, path, err);
+        if (!ok) app.ExportError = err;
+        app.ExportDone = true;
+    });
+}
+
+// ============================================================================
 // Menu bar
 // ============================================================================
 
@@ -1121,7 +1301,8 @@ static void DrawMenuBar(App& app) {
     // data while it runs. Treat "rescanning" as "no result" for node reads;
     // the tab body is already gated the same way.
     yadua::ScanResult* r = app.Rescanning ? nullptr : app.Result.get();
-    const bool busy = app.Scanning || app.Deleting || app.Rescanning;
+    const bool busy = app.Scanning || app.Deleting || app.Rescanning ||
+                      app.Exporting;
     uint32_t sel = UINT32_MAX;
     const bool hasSel = !app.Rescanning && HasSelection(app, sel);
 
@@ -1138,6 +1319,22 @@ static void DrawMenuBar(App& app) {
                     app.DriveIndex = i;
                     StartScan(app);
                 }
+            ImGui::EndMenu();
+        }
+        ImGui::Separator();
+        if (ImGui::BeginMenu("Export", app.Result && !busy)) {
+            if (ImGui::MenuItem("Full tree to CSV...")) {
+                std::wstring path;
+                if (SaveCsvDialog(app.MainWindow, L"Export full tree to CSV",
+                                  L"yadua-tree.csv", path))
+                    StartExport(app, 0, path);
+            }
+            if (ImGui::MenuItem("File list to CSV...")) {
+                std::wstring path;
+                if (SaveCsvDialog(app.MainWindow, L"Export file list to CSV",
+                                  L"yadua-files.csv", path))
+                    StartExport(app, 1, path);
+            }
             ImGui::EndMenu();
         }
         ImGui::Separator();
@@ -1224,7 +1421,8 @@ static void DrawMenuBar(App& app) {
 
 // Global keyboard shortcuts mirrored from the menus.
 static void HandleShortcuts(App& app) {
-    const bool busy = app.Scanning || app.Deleting || app.Rescanning;
+    const bool busy = app.Scanning || app.Deleting || app.Rescanning ||
+                      app.Exporting;
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_R) &&
         !app.Drives.empty() && !busy)
         StartScan(app);
@@ -1472,6 +1670,17 @@ static void DrawUi(App& app) {
         ImGui::EndPopup();
     }
 
+    if (app.Exporting && !ImGui::IsPopupOpen("Exporting"))
+        ImGui::OpenPopup("Exporting");
+    if (ImGui::BeginPopupModal("Exporting", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Exporting to %s ...", yadua::Utf8(app.ExportPath).c_str());
+        ImGui::ProgressBar(-1.0f * (float)ImGui::GetTime(),
+                           ImVec2(ImGui::GetFontSize() * 25.0f, 0.0f));
+        if (!app.Exporting) ImGui::CloseCurrentPopup(); // cleared in the main loop
+        ImGui::EndPopup();
+    }
+
     // ---- About / updates ----------------------------------------------------
     if (app.ShowAbout && !ImGui::IsPopupOpen("About YADUA"))
         ImGui::OpenPopup("About YADUA");
@@ -1641,17 +1850,40 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
                       icon, LoadCursorW(nullptr, IDC_ARROW), nullptr, nullptr,
                       L"YADUA", icon};
     RegisterClassExW(&wc);
+
+    App app;
+    ListFixedDrives(app);
+    LoadSettings(app);
+    // Restore the last-scanned drive.
+    if (!app.LastDrive.empty())
+        for (int i = 0; i < (int)app.Drives.size(); ++i)
+            if (app.Drives[i] == app.LastDrive) { app.DriveIndex = i; break; }
+    // Restore window placement if the saved rect meaningfully overlaps a
+    // monitor (else a disconnected display could put us off-screen).
+    int wx = 100, wy = 100, ww = 1280, wh = 800;
+    if (app.WinW > 200 && app.WinH > 150) {
+        int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        if (app.WinX + app.WinW > vx + 50 && app.WinX < vx + vw - 50 &&
+            app.WinY + app.WinH > vy + 50 && app.WinY < vy + vh - 50) {
+            wx = app.WinX; wy = app.WinY; ww = app.WinW; wh = app.WinH;
+        }
+    }
+
     HWND hwnd = CreateWindowW(wc.lpszClassName,
                               L"YADUA - Yet Another Disk Usage Analyzer",
-                              WS_OVERLAPPEDWINDOW, 100, 100, 1280, 800,
+                              WS_OVERLAPPEDWINDOW, wx, wy, ww, wh,
                               nullptr, nullptr, instance, nullptr);
+    app.MainWindow = hwnd;
     if (!CreateDeviceD3D(hwnd)) {
         CleanupDeviceD3D();
         MessageBoxW(nullptr, L"Failed to initialize Direct3D 11.", L"YADUA",
                     MB_ICONERROR);
         return 1;
     }
-    ShowWindow(hwnd, SW_SHOWDEFAULT);
+    ShowWindow(hwnd, SW_SHOWNORMAL); // SHOWNORMAL honors our restored rect
     UpdateWindow(hwnd);
 
     IMGUI_CHECKVERSION();
@@ -1669,9 +1901,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_d3dDevice, g_d3dContext);
 
-    App app;
-    ListFixedDrives(app);
-    LoadSettings(app);
     app.AutoScan    = cmdLine && wcsstr(cmdLine, L"--autoscan") != nullptr;
     app.OpenTreemap = cmdLine && wcsstr(cmdLine, L"--view treemap") != nullptr;
 
@@ -1706,6 +1935,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
         if (app.UpdChecking && app.UpdCheckDone) {
             app.UpdCheckThread.join();
             app.UpdChecking = false; // UI reads UpdInfo / UpdCheckError
+        }
+        if (app.Exporting && app.ExportDone) {
+            app.ExportThread.join();
+            app.Exporting = false;
+            app.Status = app.ExportError.empty()
+                             ? "Exported " + yadua::Utf8(app.ExportPath)
+                             : "Export failed: " + yadua::Utf8(app.ExportError);
         }
         if (app.UpdDownloading && app.UpdDownloadDone) {
             app.UpdDownloadThread.join();
@@ -1768,9 +2004,21 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
         g_swapChain->Present(1, 0); // vsync
     }
 
+    // Persist window placement (normal, not maximized/minimized) and drive.
+    WINDOWPLACEMENT wp{sizeof(wp)};
+    if (GetWindowPlacement(hwnd, &wp)) {
+        app.WinX = wp.rcNormalPosition.left;
+        app.WinY = wp.rcNormalPosition.top;
+        app.WinW = wp.rcNormalPosition.right - wp.rcNormalPosition.left;
+        app.WinH = wp.rcNormalPosition.bottom - wp.rcNormalPosition.top;
+    }
+    if (!app.Drives.empty()) app.LastDrive = app.Drives[app.DriveIndex];
+    SaveSettings(app);
+
     if (app.ScanThread.joinable()) app.ScanThread.join();
     if (app.DeleteThread.joinable()) app.DeleteThread.join();
     if (app.RescanThread.joinable()) app.RescanThread.join();
+    if (app.ExportThread.joinable()) app.ExportThread.join();
     if (app.UpdCheckThread.joinable()) app.UpdCheckThread.join();
     if (app.UpdDownloadThread.joinable()) app.UpdDownloadThread.join();
     ImGui_ImplDX11_Shutdown();
