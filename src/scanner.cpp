@@ -1143,6 +1143,67 @@ bool ScanVolumeFallback(const std::wstring& driveIn, unsigned threads,
     return true;
 }
 
+bool ScanFolder(const std::wstring& folder, unsigned threads, ScanResult& out,
+                std::wstring& error, ScanProgress* progress) {
+    auto t0 = std::chrono::steady_clock::now();
+    out = ScanResult{};
+    out.Drive = folder;
+    while (out.Drive.size() > 3 && out.Drive.back() == L'\\')
+        out.Drive.pop_back(); // keep "C:\" but trim deeper trailing slashes
+    out.Stats.UsedFallback = true;
+    out.Stats.ScanUnixTime = (uint64_t)_time64(nullptr);
+
+    DWORD attrs = GetFileAttributesW(out.Drive.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        error = Format(L"not an accessible folder: %ls", out.Drive.c_str());
+        return false;
+    }
+
+    // Cluster size (from the folder's volume) for the allocated-size estimate.
+    std::wstring volRoot = out.Drive.size() >= 2 && out.Drive[1] == L':'
+                               ? out.Drive.substr(0, 2) + L"\\"
+                               : out.Drive;
+    DWORD spc = 0, bps = 0, freeC = 0, totalC = 0;
+    GetDiskFreeSpaceW(volRoot.c_str(), &spc, &bps, &freeC, &totalC);
+    out.Stats.ClusterSize = spc && bps ? (uint32_t)((uint64_t)spc * bps) : 4096;
+
+    if (threads == 0) {
+        unsigned hw = std::thread::hardware_concurrency();
+        threads = hw ? std::min(hw * 2, 16u) : 4u;
+    }
+    out.Stats.Threads = threads;
+    if (progress)
+        progress->Stage.store(ScanProgress::Reading, std::memory_order_relaxed);
+
+    out.Nodes.resize(kRootRecord + 1);
+    {
+        Node& root = out.Nodes[kRootRecord];
+        root.Flags      = kNodeInUse | kNodeIsDir | kNodeNamed;
+        root.Sequence   = 1;
+        root.Parent     = (uint32_t)kRootRecord;
+        root.ParentSeq  = 1;
+        root.NameOffset = 0;
+        root.NameLength = 1;
+        out.NameArena.push_back(L'.');
+    }
+
+    WalkTree(L"\\\\?\\" + out.Drive, (uint32_t)kRootRecord, threads, out,
+             progress);
+
+    out.Stats.RecordsParsed = out.Nodes.size() - (kRootRecord + 1);
+    if (progress)
+        progress->Stage.store(ScanProgress::Aggregating, std::memory_order_relaxed);
+    Aggregate(out);
+    BuildChildIndex(out);
+    auto t2 = std::chrono::steady_clock::now();
+    out.Stats.TotalSeconds =
+        std::chrono::duration_cast<std::chrono::microseconds>(t2 - t0).count() / 1e6;
+    out.Stats.StreamSeconds = out.Stats.TotalSeconds;
+    if (progress)
+        progress->Stage.store(ScanProgress::Done, std::memory_order_relaxed);
+    return true;
+}
+
 bool ScanVolumeAuto(const std::wstring& drive, unsigned threads,
                     ScanResult& out, std::wstring& error,
                     ScanProgress* progress) {

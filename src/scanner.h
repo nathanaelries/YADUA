@@ -149,6 +149,13 @@ bool ScanVolumeAuto(const std::wstring& drive, unsigned threads,
                     ScanResult& out, std::wstring& error,
                     ScanProgress* progress = nullptr);
 
+// Scans a single folder subtree (not a whole volume) with the directory-walk
+// engine, rooted at `folder` (e.g. L"C:\\Users\\Bob"). Same ScanResult shape;
+// `out.Drive` is set to the folder so paths render rooted there. No admin
+// needed. Returns false / sets `error` if the path isn't an accessible folder.
+bool ScanFolder(const std::wstring& folder, unsigned threads, ScanResult& out,
+                std::wstring& error, ScanProgress* progress = nullptr);
+
 // Recomputes FileCount/DirCount, cumulative totals, and the child index from
 // Nodes — call after in-place modifications (deletion, subtree rescan).
 void Reindex(ScanResult& r);

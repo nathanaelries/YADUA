@@ -21,6 +21,7 @@
 #include <commdlg.h>
 #include <d3d11.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <objbase.h>
 
 #include <algorithm>
@@ -246,6 +247,42 @@ static void StartScan(App& app) {
         if (!yadua::ScanVolumeAuto(drive, 0, *app.Pending, err, &app.Progress))
             app.PendingError = err;
         app.ScanDone = true; // release: PendingError/Pending written before this
+    });
+}
+
+// Folder picker (File > Scan folder...). Returns false if cancelled.
+static bool PickFolder(HWND owner, std::wstring& out) {
+    wchar_t path[MAX_PATH] = {};
+    BROWSEINFOW bi{};
+    bi.hwndOwner = owner;
+    bi.pszDisplayName = path;
+    bi.lpszTitle = L"Choose a folder to scan";
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    PIDLIST_ABSOLUTE pidl = SHBrowseForFolderW(&bi);
+    if (!pidl) return false;
+    bool ok = SHGetPathFromIDListW(pidl, path) != FALSE;
+    CoTaskMemFree(pidl);
+    if (ok) out = path;
+    return ok;
+}
+
+// Scan a chosen folder subtree (directory-walk engine rooted there).
+static void StartFolderScan(App& app, const std::wstring& folder) {
+    if (app.Scanning || app.Deleting || app.Rescanning || app.Exporting) return;
+    if (app.ScanThread.joinable()) app.ScanThread.join();
+    app.Pending = std::make_unique<yadua::ScanResult>();
+    app.Progress.BytesRead  = 0;
+    app.Progress.TotalBytes = 0;
+    app.Progress.Stage      = yadua::ScanProgress::Opening;
+    app.ScanDone  = false;
+    app.Scanning  = true;
+    app.Error.clear();
+    std::wstring path = folder;
+    app.ScanThread = std::thread([&app, path] {
+        std::wstring err;
+        if (!yadua::ScanFolder(path, 0, *app.Pending, err, &app.Progress))
+            app.PendingError = err;
+        app.ScanDone = true;
     });
 }
 
@@ -1389,6 +1426,11 @@ static void DrawMenuBar(App& app) {
                     StartScan(app);
                 }
             ImGui::EndMenu();
+        }
+        if (ImGui::MenuItem("Scan folder...", nullptr, false, !busy)) {
+            std::wstring folder;
+            if (PickFolder(app.MainWindow, folder))
+                StartFolderScan(app, folder);
         }
         ImGui::Separator();
         if (ImGui::BeginMenu("Export", app.Result && !busy)) {

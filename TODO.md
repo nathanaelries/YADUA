@@ -133,8 +133,9 @@
 - [x] **Export from the GUI** (File ▸ Export): full tree or the current
       (filtered) file list to CSV, written on a background thread so a big
       volume can't freeze the UI. (JSON still CLI-only.)
-- [ ] **Scan a specific folder / path**, not just a whole volume (File ▸ Scan
-      folder...), via the directory-walk scanner rooted at the chosen path
+- [x] **Scan a specific folder / path**: File ▸ Scan folder... opens a folder
+      picker and runs the directory-walk engine (new `ScanFolder`) rooted at
+      the chosen path; paths render rooted there. Verified headlessly on src/.
 - [x] **Allocated column alongside Size**, plus show/hide + reorder columns:
       an "Allocated" column (hidden by default) in the Tree and Files views,
       right-click a header to show/hide, drag to reorder
