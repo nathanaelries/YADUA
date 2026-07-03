@@ -73,8 +73,10 @@ struct App {
     uint32_t             SelectedNode = UINT32_MAX;
     uint32_t             RevealNode   = UINT32_MAX; // tree scrolls here, 1 frame
     std::vector<uint8_t> RevealOpen;                // ancestors to force open
-    bool                 SwitchToTree    = false;
-    bool                 SwitchToTreemap = false;
+    bool                 SwitchToTree     = false;
+    bool                 SwitchToTreemap  = false;
+    bool                 SwitchToFileTypes = false; // View menu -> File Types tab
+    bool                 FocusFilter      = false;  // Search/Ctrl+F -> filter box
 
     // Tree sorting. The scanner's child index is size-descending (canonical);
     // any other order lives in SortedChildren (parallel to Children.List).
@@ -1049,6 +1051,144 @@ static void DrawTypesTab(App& app, const yadua::ScanResult& r) {
 }
 
 // ============================================================================
+// Menu bar
+// ============================================================================
+
+// The current selection, if it still exists (deletion can invalidate it).
+static bool HasSelection(const App& app, uint32_t& sel) {
+    sel = app.SelectedNode;
+    const yadua::ScanResult* r = app.Result.get();
+    return r && sel != UINT32_MAX && sel < r->Nodes.size() && r->Exists(sel);
+}
+
+static void DrawMenuBar(App& app) {
+    yadua::ScanResult* r = app.Result.get();
+    const bool busy = app.Scanning || app.Deleting || app.Rescanning ||
+                      app.Applying;
+    uint32_t sel;
+    const bool hasSel = HasSelection(app, sel);
+
+    if (!ImGui::BeginMenuBar()) return;
+
+    if (ImGui::BeginMenu("File")) {
+        if (ImGui::MenuItem(r ? "Rescan" : "Scan", "Ctrl+R", false,
+                            !app.Drives.empty() && !busy))
+            StartScan(app);
+        if (ImGui::BeginMenu("Scan drive", !app.Drives.empty() && !busy)) {
+            for (int i = 0; i < (int)app.Drives.size(); ++i)
+                if (ImGui::MenuItem(app.DriveLabels[i].c_str(), nullptr,
+                                    i == app.DriveIndex)) {
+                    app.DriveIndex = i;
+                    StartScan(app);
+                }
+            ImGui::EndMenu();
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Exit", "Alt+F4")) PostQuitMessage(0);
+        ImGui::EndMenu();
+    }
+
+    if (ImGui::BeginMenu("Edit")) {
+        if (ImGui::MenuItem("Copy path", "Ctrl+C", false, hasSel))
+            ImGui::SetClipboardText(yadua::Utf8(r->Path(sel)).c_str());
+        if (ImGui::MenuItem("Open in Explorer", nullptr, false, hasSel)) {
+            std::wstring args = L"/select,\"" + r->Path(sel) + L"\"";
+            ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(),
+                          nullptr, SW_SHOWNORMAL);
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Delete to Recycle Bin", "Del", false,
+                            hasSel && sel != (uint32_t)yadua::kRootRecord &&
+                                !app.Deleting))
+            app.ConfirmDelete = sel;
+        ImGui::EndMenu();
+    }
+
+    if (ImGui::BeginMenu("View")) {
+        ImGui::MenuItem("Treemap panel", nullptr, &app.ShowMapPanel);
+        ImGui::MenuItem("Treemap cushion shading", nullptr, &app.Treemap.Cushion);
+        ImGui::Separator();
+        ImGui::BeginDisabled(!r);
+        if (ImGui::MenuItem("Tree"))       app.SwitchToTree = true;
+        if (ImGui::MenuItem("Files"))      app.SwitchToFiles = true;
+        if (ImGui::MenuItem("File Types")) app.SwitchToFileTypes = true;
+        if (ImGui::MenuItem("Treemap"))    app.SwitchToTreemap = true;
+        ImGui::EndDisabled();
+        ImGui::EndMenu();
+    }
+
+    if (ImGui::BeginMenu("Search")) {
+        if (ImGui::MenuItem("Find...", "Ctrl+F", false, r != nullptr))
+            app.FocusFilter = true;
+        if (ImGui::MenuItem("Clear filter", "Esc", false, app.Filter[0] != 0)) {
+            app.Filter[0] = '\0';
+            RecomputeFilter(app);
+        }
+        ImGui::EndMenu();
+    }
+
+    if (ImGui::BeginMenu("Tools")) {
+        const bool live = app.Monitor.Active() && !app.Monitor.Lost();
+        const uint64_t pending = live ? app.Monitor.Pending() : 0;
+        char applyLbl[64];
+        snprintf(applyLbl, sizeof(applyLbl), "Apply %llu filesystem change%s",
+                 (unsigned long long)pending, pending == 1 ? "" : "s");
+        if (ImGui::MenuItem(applyLbl, nullptr, false, pending > 0 && !busy))
+            StartApply(app);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal | ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Fold filesystem changes seen since the scan into "
+                              "the tree (via the NTFS change journal), without "
+                              "a full rescan.");
+        const bool canRescan = hasSel && r->IsDir(sel) &&
+                               !(r->Nodes[sel].Flags & yadua::kNodeReparse) &&
+                               !busy;
+        if (ImGui::MenuItem("Rescan selected folder", nullptr, false, canRescan))
+            StartRescan(app, sel);
+        ImGui::Separator();
+        if (ImGui::MenuItem("Check for updates...", nullptr, false,
+                            yadua::UpdaterConfigured() && !app.UpdChecking &&
+                                !app.UpdDownloading)) {
+            StartUpdateCheck(app, true);
+            app.ShowAbout = true; // surface the result
+        }
+        ImGui::EndMenu();
+    }
+
+    if (ImGui::BeginMenu("Help")) {
+        if (ImGui::MenuItem("About YADUA")) app.ShowAbout = true;
+        if (ImGui::MenuItem("Project on GitHub"))
+            ShellExecuteW(nullptr, L"open",
+                          L"https://github.com/nathanaelries/YADUA", nullptr,
+                          nullptr, SW_SHOWNORMAL);
+        ImGui::EndMenu();
+    }
+
+    ImGui::EndMenuBar();
+}
+
+// Global keyboard shortcuts mirrored from the menus.
+static void HandleShortcuts(App& app) {
+    const bool busy = app.Scanning || app.Deleting || app.Rescanning ||
+                      app.Applying;
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_R) &&
+        !app.Drives.empty() && !busy)
+        StartScan(app);
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F))
+        app.FocusFilter = true;
+    // Text-editing keys only act on nodes when no input box has focus.
+    if (!ImGui::GetIO().WantTextInput) {
+        uint32_t sel;
+        if (ImGui::IsKeyPressed(ImGuiKey_Delete) && HasSelection(app, sel) &&
+            sel != (uint32_t)yadua::kRootRecord && !app.Deleting)
+            app.ConfirmDelete = sel;
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape) && app.Filter[0]) {
+            app.Filter[0] = '\0';
+            RecomputeFilter(app);
+        }
+    }
+}
+
+// ============================================================================
 // Top-level UI
 // ============================================================================
 
@@ -1058,8 +1198,11 @@ static void DrawUi(App& app) {
     ImGui::SetNextWindowSize(vp->WorkSize);
     ImGui::Begin("##main", nullptr,
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-                 ImGuiWindowFlags_NoSavedSettings |
+                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_MenuBar |
                  ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+    DrawMenuBar(app);
+    HandleShortcuts(app);
 
     // ---- Toolbar -----------------------------------------------------------
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 4.0f);
@@ -1076,6 +1219,7 @@ static void DrawUi(App& app) {
     ImGui::EndDisabled();
     ImGui::SameLine();
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14.0f);
+    if (app.FocusFilter) { ImGui::SetKeyboardFocusHere(); app.FocusFilter = false; }
     if (ImGui::InputTextWithHint("##filter", "filter: name  *.ext  >100mb",
                                  app.Filter, sizeof(app.Filter)))
         RecomputeFilter(app);
@@ -1084,8 +1228,6 @@ static void DrawUi(App& app) {
                           "  setup        name contains \"setup\"\n"
                           "  *.iso        extension filter (or ext:iso)\n"
                           "  >100mb <2gb  size filter (b/kb/mb/gb/tb)");
-    ImGui::SameLine();
-    ImGui::Checkbox("Map panel", &app.ShowMapPanel);
 
     if (app.Result && !app.Rescanning) {
         ImGui::SameLine();
@@ -1103,39 +1245,26 @@ static void DrawUi(App& app) {
                               "scan used the slower directory walk.",
                               yadua::Utf8(app.Result->FallbackReason).c_str());
     }
+    // Live change tracking: a passive indicator here; the action lives in
+    // Tools > Apply filesystem changes.
     if (app.Result && !app.Rescanning && !app.Applying && app.Monitor.Active()) {
         ImGui::SameLine();
         if (app.Monitor.Lost()) {
             ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f),
-                               "| live updates lost - rescan");
+                               "| live tracking lost - rescan");
         } else {
             uint64_t pending = app.Monitor.Pending();
-            ImGui::TextDisabled("| live: %llu changes", pending);
-            if (pending) {
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Apply")) StartApply(app);
-            }
+            ImGui::TextDisabled("| %llu change%s since scan", pending,
+                                pending == 1 ? "" : "s");
+            if (pending && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+                ImGui::SetTooltip("Tools > Apply filesystem changes folds these "
+                                  "into the tree without a full rescan.");
         }
     }
     if (!app.Status.empty()) {
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1.0f), "| %s",
                            app.Status.c_str());
-    }
-
-    // About / update affordance, right-aligned on the toolbar row.
-    {
-        bool upd = UpdateBannerVisible(app);
-        const char* lbl = upd ? "Update ready" : "About";
-        float bw = ImGui::CalcTextSize(lbl).x +
-                   ImGui::GetStyle().FramePadding.x * 2.0f;
-        float rx = ImGui::GetWindowContentRegionMax().x - bw;
-        ImGui::SameLine();
-        if (rx > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(rx);
-        if (upd)
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.45f, 0.22f, 1));
-        if (ImGui::SmallButton(lbl)) app.ShowAbout = true;
-        if (upd) ImGui::PopStyleColor();
     }
     ImGui::Separator();
 
@@ -1228,7 +1357,10 @@ static void DrawUi(App& app) {
                 DrawFilesTab(app, *app.Result);
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("File Types")) {
+            if (ImGui::BeginTabItem("File Types", nullptr,
+                                    app.SwitchToFileTypes
+                                        ? ImGuiTabItemFlags_SetSelected : 0)) {
+                app.SwitchToFileTypes = false;
                 DrawTypesTab(app, *app.Result);
                 ImGui::EndTabItem();
             }
