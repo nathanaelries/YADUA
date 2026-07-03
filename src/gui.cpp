@@ -106,6 +106,17 @@ struct App {
     std::vector<uint32_t> SortedChildren;
     bool                  UseSorted = false;
 
+    // The tree is not virtualized (unlike Files/File Types). A filter
+    // force-expands every matching folder; clearing the filter then leaves
+    // them open, so an unfiltered render would dump ALL their children -
+    // millions of rows in one frame (a hard freeze). Two guards:
+    //  - TreeGen is bumped when a filter is cleared and used as an ID prefix,
+    //    which resets every folder's open state (collapses the tree).
+    //  - TreeRowBudget hard-caps rows submitted per frame; the overflow rolls
+    //    into each folder's "(... N more)" line.
+    int                   TreeGen       = 0;
+    int                   TreeRowBudget = 0;
+
     // Flat "Files" view (WizTree-style largest-files list, ignoring folder
     // structure) and "File Types" summary (space grouped by extension). Both
     // are derived from the current filter and cached until it changes;
@@ -271,10 +282,18 @@ static std::vector<FilterTerm> ParseFilter(const char* utf8) {
 static void RecomputeFilter(App& app) {
     app.FileListDirty = true; // the flat Files / File Types views derive from it
     app.TypeListDirty = true;
+    const bool wasFiltered = !app.Visible.empty();
     const yadua::ScanResult* r = app.Result.get();
     std::vector<FilterTerm> terms = r ? ParseFilter(app.Filter)
                                       : std::vector<FilterTerm>{};
-    if (terms.empty()) { app.Visible.clear(); return; }
+    if (terms.empty()) {
+        // Clearing an active filter: collapse the tree that the filter
+        // force-expanded (a new ID generation = fresh, all-collapsed state),
+        // so an unfiltered render doesn't dump every folder's full contents.
+        if (wasFiltered) ++app.TreeGen;
+        app.Visible.clear();
+        return;
+    }
 
     app.Visible.assign(r->Nodes.size(), 0);
     std::wstring name;              // reused across nodes: assign() keeps its
@@ -697,11 +716,15 @@ static void DrawTree(App& app, const yadua::ScanResult& r, uint32_t idx,
                              (child < app.RevealOpen.size() && app.RevealOpen[child]);
             if (!r.Exists(child)) continue;            // recycled this session
             if (filtered && !app.Visible[child] && !revealing) continue;
-            if (shown >= kMaxChildrenShown && !revealing) {
+            // Per-directory cap, and a global per-frame row budget so a huge
+            // expanded/filtered tree can't submit millions of rows and freeze.
+            if ((shown >= kMaxChildrenShown || app.TreeRowBudget <= 0) &&
+                !revealing) {
                 ++hidden;
                 hiddenBytes += r.SizeOf(child);
                 continue;
             }
+            --app.TreeRowBudget;
             DrawTree(app, r, child, size, false);
             ++shown;
         }
@@ -753,7 +776,12 @@ static void DrawTreeTable(App& app, const yadua::ScanResult& r) {
         specs->SpecsDirty = false;
     }
 
+    // Hard cap on rows submitted this frame (the tree isn't virtualized), and
+    // an ID generation that resets open state when a filter is cleared.
+    app.TreeRowBudget = 50000;
+    ImGui::PushID(app.TreeGen);
     DrawTree(app, r, (uint32_t)yadua::kRootRecord, 0, true);
+    ImGui::PopID();
     ImGui::EndTable();
 
     // Reveal is a one-shot: ancestors were forced open and the row scrolled
