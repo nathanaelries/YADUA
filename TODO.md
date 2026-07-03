@@ -118,6 +118,10 @@
       - added WinHTTP timeouts so a stalled update can't block shutdown
       - fixed a rescan-vs-UI data race (menu/shortcuts read the tree while a
         worker mutated it) and a null render-target deref on resize
+      - hardened the scan worker pools (StreamMft + WalkTree) against a mid-scan
+        bad_alloc: worker bodies catch-all so an exception can't escape a thread
+        (std::terminate); a shared error flag + join scope-guard make the others
+        exit cleanly (no deadlock) and the scan reports the failure
 
 ## Phase 4 — WizTree / WinDirStat competitive parity
 

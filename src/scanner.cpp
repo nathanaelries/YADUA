@@ -400,6 +400,7 @@ bool StreamMft(HANDLE volume, const std::vector<Extent>& mftRuns,
     }
 
     contexts.resize(workerCount);
+    std::atomic<bool> workerError{false}; // a parser threw (e.g. bad_alloc)
     std::vector<std::thread> workers;
     workers.reserve(workerCount);
     for (unsigned t = 0; t < workerCount; ++t) {
@@ -410,13 +411,29 @@ bool StreamMft(HANDLE volume, const std::vector<Extent>& mftRuns,
             ParseContext& ctx = contexts[t];
             Chunk* chunk = nullptr;
             while (readyQueue.Pop(chunk)) {
-                for (size_t off = 0; off < chunk->Bytes; off += recordSize)
-                    ParseRecord(chunk->Data.data() + off, recordSize,
-                                chunk->FirstRecord + off / recordSize, ctx);
+                // Contain any exception (bad_alloc on a huge volume) so it
+                // never escapes the thread -> std::terminate; always return the
+                // chunk so the reader can't block on freeQueue.
+                try {
+                    if (!workerError.load(std::memory_order_relaxed))
+                        for (size_t off = 0; off < chunk->Bytes; off += recordSize)
+                            ParseRecord(chunk->Data.data() + off, recordSize,
+                                        chunk->FirstRecord + off / recordSize, ctx);
+                } catch (...) {
+                    workerError.store(true, std::memory_order_relaxed);
+                }
                 freeQueue.Push(chunk);
             }
         });
     }
+    // Stop + join the parsers on EVERY exit path (including an exception from
+    // the reader loop's allocations below), so ~vector<thread> never runs with
+    // joinable threads.
+    struct Joiner {
+        BlockingQueue<Chunk>& q;
+        std::vector<std::thread>& w;
+        ~Joiner() { q.Close(); for (auto& t : w) if (t.joinable()) t.join(); }
+    } joiner{readyQueue, workers};
 
     // FILE records can straddle chunk (or even extent) boundaries when the
     // cluster size is smaller than the record size; `carry` holds the partial
@@ -441,7 +458,9 @@ bool StreamMft(HANDLE volume, const std::vector<Extent>& mftRuns,
 
     uint64_t streamed = 0; // bytes of the $MFT data stream consumed so far
     for (const Extent& run : mftRuns) {
-        if (readError || streamed >= mftBytes) break;
+        if (readError || workerError.load(std::memory_order_relaxed) ||
+            streamed >= mftBytes)
+            break;
         uint64_t runBytes =
             std::min(run.Clusters * (uint64_t)clusterSize, mftBytes - streamed);
 
@@ -492,6 +511,10 @@ bool StreamMft(HANDLE volume, const std::vector<Extent>& mftRuns,
     readyQueue.Close();
     for (std::thread& w : workers) w.join();
     result.Stats.RecordsParsed = nextRecord;
+    if (workerError.load()) {
+        if (error.empty()) error = L"out of memory while parsing the MFT";
+        return false;
+    }
     return !readError;
 }
 
@@ -812,6 +835,7 @@ void WalkTree(const std::wstring& rootPath, uint32_t rootNode, unsigned threads,
     std::condition_variable cv;
     std::deque<std::pair<std::wstring, uint32_t>> work;
     size_t pending = 1;
+    std::atomic<bool> walkError{false}; // a worker threw (e.g. bad_alloc)
     work.emplace_back(rootPath, rootNode);
 
     struct Entry {
@@ -824,11 +848,19 @@ void WalkTree(const std::wstring& rootPath, uint32_t rootNode, unsigned threads,
     };
 
     auto worker = [&] {
+      // Contain any exception (bad_alloc) so it can't escape the thread
+      // (std::terminate). walkError is in the wait predicate + exit test, so
+      // one worker failing wakes the rest to exit cleanly - no deadlock.
+      try {
         std::vector<Entry> entries;
         for (;;) {
             std::unique_lock<std::mutex> lock(mutex);
-            cv.wait(lock, [&] { return !work.empty() || pending == 0; });
-            if (work.empty()) return; // pending == 0: all done
+            cv.wait(lock, [&] {
+                return !work.empty() || pending == 0 ||
+                       walkError.load(std::memory_order_relaxed);
+            });
+            if (work.empty() || walkError.load(std::memory_order_relaxed))
+                return; // pending == 0 (all done) or a worker failed
             auto [dirPath, dirNode] = std::move(work.front());
             work.pop_front();
             lock.unlock();
@@ -898,6 +930,10 @@ void WalkTree(const std::wstring& rootPath, uint32_t rootNode, unsigned threads,
             if (finished) cv.notify_all();
             else cv.notify_one();
         }
+      } catch (...) {
+        walkError.store(true, std::memory_order_relaxed);
+        cv.notify_all(); // wake the others; walkError makes them exit
+      }
     };
 
     std::vector<std::thread> pool;
