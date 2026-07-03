@@ -141,9 +141,13 @@
 - [x] **Remember window size/position and the last-scanned drive** across runs
       (persisted in the settings file)
 - [ ] **Multi-select** in the tree and Files list for bulk delete / export
-- [ ] **Free / unused space** surfaced in the totals and as a slice in the
-      treemap (WizTree shows free space and MFT/overhead)
-- [ ] **File attributes / owner** columns (H/S/R/A, compressed, encrypted)
+- [~] **Free / unused space**: used / free / total shown in the toolbar after
+      a scan (GetDiskFreeSpaceEx). The treemap free-space *slice* is deferred -
+      it's a visual layout change that wants eyes-on verification.
+- [x] **File attributes** column: Win32 FILE_ATTRIBUTE_* captured from
+      `$STANDARD_INFORMATION` (offset 0x20) and the walk fallback, shown as
+      R/H/S/A/C/E letters in the Tree and Files views (hidden by default) and
+      in CSV exports. (Owner column deferred - needs per-file security lookups.)
 - [ ] **In-GUI compare/history** view over snapshots (the CLI already does
       `--snapshot` / `--diff`; surface it in the UI)
 - [ ] **Custom "open with" / user commands** on a selection (WinDirStat's

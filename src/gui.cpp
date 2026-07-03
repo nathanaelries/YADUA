@@ -208,6 +208,11 @@ struct App {
     HWND                MainWindow = nullptr;
     int                 WinX = INT_MIN, WinY = INT_MIN, WinW = 0, WinH = 0;
     std::wstring        LastDrive;                 // e.g. L"C:"
+
+    // Volume capacity (from GetDiskFreeSpaceEx at scan time) so the toolbar can
+    // show used / free / total, and the treemap can reserve a free-space slice.
+    uint64_t            VolTotalBytes = 0;
+    uint64_t            VolFreeBytes  = 0;
 };
 
 // All fixed drives: NTFS gets the fast MFT scan, anything else (or a
@@ -1580,6 +1585,14 @@ static void DrawUi(App& app) {
             ImGui::SetTooltip("Raw MFT access was unavailable (%s), so this "
                               "scan used the slower directory walk.",
                               yadua::Utf8(app.Result->FallbackReason).c_str());
+        if (app.VolTotalBytes) {
+            ImGui::SameLine();
+            uint64_t used = app.VolTotalBytes - app.VolFreeBytes;
+            ImGui::TextDisabled("| disk: %s used / %s (%s free)",
+                                yadua::HumanSize(used).c_str(),
+                                yadua::HumanSize(app.VolTotalBytes).c_str(),
+                                yadua::HumanSize(app.VolFreeBytes).c_str());
+        }
     }
     if (!app.Status.empty()) {
         ImGui::SameLine();
@@ -2043,6 +2056,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
             if (app.PendingError.empty()) {
                 app.Result = std::move(app.Pending);
                 app.Result->DisplayAllocated = app.ShowAllocated; // keep the toggle
+                // Volume capacity for the used/free/total readout.
+                ULARGE_INTEGER avail{}, total{}, totalFree{};
+                std::wstring volRoot = app.Result->Drive + L"\\";
+                if (GetDiskFreeSpaceExW(volRoot.c_str(), &avail, &total, &totalFree)) {
+                    app.VolTotalBytes = total.QuadPart;
+                    app.VolFreeBytes  = totalFree.QuadPart;
+                } else {
+                    app.VolTotalBytes = app.VolFreeBytes = 0;
+                }
                 app.UseSorted = false;
                 app.Treemap.Reset();
                 app.Status.clear();
