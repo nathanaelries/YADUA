@@ -233,6 +233,24 @@ static void ListFixedDrives(App& app) {
     }
 }
 
+// Guard OS-critical items from accidental recycle: the volume root, anything
+// with the SYSTEM attribute (pagefile.sys, hiberfil.sys, protected OS files
+// and folders), and a few well-known top-level directories.
+static bool IsProtectedFromDelete(const yadua::ScanResult& r, uint32_t idx) {
+    if (idx == (uint32_t)yadua::kRootRecord) return true;
+    if (r.Nodes[idx].Attributes & FILE_ATTRIBUTE_SYSTEM) return true;
+    std::wstring p = r.Path(idx), d = r.Drive;
+    for (wchar_t& c : p) c = towlower(c);
+    for (wchar_t& c : d) c = towlower(c);
+    static const wchar_t* critical[] = {
+        L"\\windows", L"\\program files", L"\\program files (x86)",
+        L"\\programdata", L"\\system volume information", L"\\$recycle.bin",
+        L"\\recovery", L"\\$winreagent", L"\\perflogs"};
+    for (const wchar_t* c : critical)
+        if (p == d + c) return true;
+    return false;
+}
+
 static void StartScan(App& app) {
     if (app.Scanning || app.Deleting || app.Rescanning || app.Exporting ||
         app.Drives.empty())
@@ -482,7 +500,7 @@ static void StartRescan(App& app, uint32_t node) {
 
 static void StartDelete(App& app, uint32_t node) {
     if (app.Deleting || app.Scanning || app.Rescanning || app.Exporting ||
-        !app.Result)
+        !app.Result || IsProtectedFromDelete(*app.Result, node))
         return;
     if (app.DeleteThread.joinable()) app.DeleteThread.join();
     app.DeleteNode   = node;
@@ -798,10 +816,17 @@ static void NodeMenuItems(App& app, const yadua::ScanResult& r, uint32_t idx,
         ImGui::EndMenu();
     }
     ImGui::Separator();
-    ImGui::BeginDisabled(idx == (uint32_t)yadua::kRootRecord || app.Deleting);
+    bool protectedItem = IsProtectedFromDelete(r, idx);
+    ImGui::BeginDisabled(protectedItem || app.Deleting);
     if (ImGui::MenuItem("Delete (Recycle Bin)..."))
         app.ConfirmDelete = idx;
     ImGui::EndDisabled();
+    if (protectedItem &&
+        ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled |
+                             ImGuiHoveredFlags_DelayNormal))
+        ImGui::SetTooltip("Protected: system / OS-critical items (pagefile,\n"
+                          "hiberfil, Windows, Program Files, ...) can't be\n"
+                          "deleted from here.");
 }
 
 // ============================================================================
@@ -1558,7 +1583,7 @@ static void DrawMenuBar(App& app) {
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Delete to Recycle Bin", "Del", false,
-                            hasSel && sel != (uint32_t)yadua::kRootRecord &&
+                            hasSel && !IsProtectedFromDelete(*r, sel) &&
                                 !app.Deleting))
             app.ConfirmDelete = sel;
         ImGui::EndMenu();
@@ -1639,7 +1664,7 @@ static void HandleShortcuts(App& app) {
     if (!ImGui::GetIO().WantTextInput && !app.Rescanning) {
         uint32_t sel;
         if (ImGui::IsKeyPressed(ImGuiKey_Delete) && HasSelection(app, sel) &&
-            sel != (uint32_t)yadua::kRootRecord && !app.Deleting)
+            !IsProtectedFromDelete(*app.Result, sel) && !app.Deleting)
             app.ConfirmDelete = sel;
         if (ImGui::IsKeyPressed(ImGuiKey_Escape) && app.Filter[0]) {
             app.Filter[0] = '\0';
