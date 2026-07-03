@@ -110,11 +110,12 @@
 - [x] "Size on disk" (allocated) toggle: View menu flips the tree, treemap,
       Files/File Types, and totals between logical size and bytes reserved on
       disk (the choice is remembered)
-- [ ] **Modified-date column** (and created/accessed): capture the
-      `$STANDARD_INFORMATION` timestamps while parsing MFT records into `Node`,
-      surface a sortable Date Modified column in the tree + Files views, and
-      bump the snapshot format. (Both WizTree and WinDirStat show dates; this
-      is the biggest single gap. Touches scanner + snapshot + GUI.)
+- [x] **Modified-date column**: the raw-MFT scan reads the
+      `$STANDARD_INFORMATION` last-write time (the one Explorer shows) into
+      `Node`, and the directory-walk fallback reads `ftLastWriteTime`. A
+      sortable, reorderable "Modified" column now appears in the Tree and
+      Files views; the snapshot format bumped to v2 (v1 still loads); CSV/JSON
+      exports gained a `modified` field. (created/accessed times not surfaced.)
 - [ ] **Export from the GUI** (File ▸ Export): dump the current tree or the
       Files list to CSV/JSON, reusing the CLI's export code path. WizTree
       exports from its UI; today YADUA only exports from the console.

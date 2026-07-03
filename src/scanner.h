@@ -26,6 +26,7 @@ namespace yadua {
 struct Node {
     uint64_t LogicalSize   = 0; // file size (EOF) of the unnamed $DATA stream
     uint64_t AllocatedSize = 0; // bytes of disk actually reserved
+    uint64_t ModifiedTime  = 0; // $STANDARD_INFORMATION last-write FILETIME (0=unknown)
     uint32_t NameOffset    = 0; // into NameArena
     uint32_t Parent        = 0; // MFT record number of parent directory
     uint16_t ParentSeq     = 0; // expected sequence number of the parent record

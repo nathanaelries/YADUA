@@ -35,6 +35,23 @@ static std::string CsvEscape(std::string s) {
     return out + "\"";
 }
 
+// A FILETIME (100 ns since 1601 UTC) as a local "YYYY-MM-DD HH:MM:SS" string;
+// empty when unknown (0), matching what the GUI's Modified column shows.
+static std::string IsoTime(uint64_t filetime) {
+    if (filetime == 0) return std::string();
+    FILETIME utc, local;
+    utc.dwLowDateTime  = (DWORD)(filetime & 0xFFFFFFFFull);
+    utc.dwHighDateTime = (DWORD)(filetime >> 32);
+    SYSTEMTIME st;
+    if (!FileTimeToLocalFileTime(&utc, &local) ||
+        !FileTimeToSystemTime(&local, &st))
+        return std::string();
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d", st.wYear,
+             st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    return buf;
+}
+
 static void JsonWriteString(FILE* f, const std::string& s) {
     fputc('"', f);
     for (unsigned char c : s) {
@@ -59,16 +76,18 @@ struct TopLists {
 static void ExportCsv(FILE* f, const ScanResult& r, const TopLists& top,
                       bool fullTree) {
     fputs("\xEF\xBB\xBF", f); // UTF-8 BOM so Excel decodes correctly
-    fputs("type,path,size_bytes,allocated_bytes,files,folders\n", f);
+    fputs("type,path,size_bytes,allocated_bytes,files,folders,modified\n", f);
 
     auto folderRow = [&](const std::string& path, uint32_t idx) {
-        fprintf(f, "folder,%s,%llu,%llu,%llu,%llu\n", CsvEscape(path).c_str(),
+        fprintf(f, "folder,%s,%llu,%llu,%llu,%llu,%s\n", CsvEscape(path).c_str(),
                 r.Totals[idx].LogicalSize, r.Totals[idx].AllocatedSize,
-                r.Totals[idx].FileCount, r.Totals[idx].DirCount);
+                r.Totals[idx].FileCount, r.Totals[idx].DirCount,
+                IsoTime(r.Nodes[idx].ModifiedTime).c_str());
     };
     auto fileRow = [&](const std::string& path, uint32_t idx) {
-        fprintf(f, "file,%s,%llu,%llu,,\n", CsvEscape(path).c_str(),
-                r.Nodes[idx].LogicalSize, r.Nodes[idx].AllocatedSize);
+        fprintf(f, "file,%s,%llu,%llu,,,%s\n", CsvEscape(path).c_str(),
+                r.Nodes[idx].LogicalSize, r.Nodes[idx].AllocatedSize,
+                IsoTime(r.Nodes[idx].ModifiedTime).c_str());
     };
 
     if (!fullTree) {
@@ -118,9 +137,10 @@ static void ExportJson(FILE* f, const ScanResult& r, const TopLists& top,
         fputs("{\"path\": ", f);
         JsonWriteString(f, Utf8(r.Path(idx)));
         fprintf(f, ", \"size\": %llu, \"allocated\": %llu, "
-                   "\"files\": %llu, \"folders\": %llu}",
+                   "\"files\": %llu, \"folders\": %llu, \"modified\": \"%s\"}",
                 r.Totals[idx].LogicalSize, r.Totals[idx].AllocatedSize,
-                r.Totals[idx].FileCount, r.Totals[idx].DirCount);
+                r.Totals[idx].FileCount, r.Totals[idx].DirCount,
+                IsoTime(r.Nodes[idx].ModifiedTime).c_str());
     }
     fputs("\n  ],\n  \"top_files\": [", f);
     for (size_t i = 0; i < top.FileCount; ++i) {
@@ -128,8 +148,9 @@ static void ExportJson(FILE* f, const ScanResult& r, const TopLists& top,
         fputs(i ? ",\n    " : "\n    ", f);
         fputs("{\"path\": ", f);
         JsonWriteString(f, Utf8(r.Path(idx)));
-        fprintf(f, ", \"size\": %llu, \"allocated\": %llu}",
-                r.Nodes[idx].LogicalSize, r.Nodes[idx].AllocatedSize);
+        fprintf(f, ", \"size\": %llu, \"allocated\": %llu, \"modified\": \"%s\"}",
+                r.Nodes[idx].LogicalSize, r.Nodes[idx].AllocatedSize,
+                IsoTime(r.Nodes[idx].ModifiedTime).c_str());
     }
     fputs("\n  ]", f);
 
@@ -140,9 +161,11 @@ static void ExportJson(FILE* f, const ScanResult& r, const TopLists& top,
             JsonWriteString(f, isRoot ? Utf8(r.Drive) : Utf8(r.Name(idx)));
             if (r.IsDir(idx)) {
                 fprintf(f, ", \"size\": %llu, \"allocated\": %llu, "
-                           "\"files\": %llu, \"folders\": %llu, \"children\": [",
+                           "\"files\": %llu, \"folders\": %llu, "
+                           "\"modified\": \"%s\", \"children\": [",
                         r.Totals[idx].LogicalSize, r.Totals[idx].AllocatedSize,
-                        r.Totals[idx].FileCount, r.Totals[idx].DirCount);
+                        r.Totals[idx].FileCount, r.Totals[idx].DirCount,
+                        IsoTime(r.Nodes[idx].ModifiedTime).c_str());
                 for (uint32_t c = r.Children.Offset[idx];
                      c < r.Children.Offset[idx + 1]; ++c) {
                     if (c != r.Children.Offset[idx]) fputc(',', f);
@@ -150,8 +173,10 @@ static void ExportJson(FILE* f, const ScanResult& r, const TopLists& top,
                 }
                 fputs("]}", f);
             } else {
-                fprintf(f, ", \"size\": %llu, \"allocated\": %llu}",
-                        r.Nodes[idx].LogicalSize, r.Nodes[idx].AllocatedSize);
+                fprintf(f, ", \"size\": %llu, \"allocated\": %llu, "
+                           "\"modified\": \"%s\"}",
+                        r.Nodes[idx].LogicalSize, r.Nodes[idx].AllocatedSize,
+                        IsoTime(r.Nodes[idx].ModifiedTime).c_str());
             }
         };
         emit(kRootRecord, true);

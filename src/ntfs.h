@@ -34,6 +34,7 @@ constexpr uint16_t kRecordInUse       = 0x0001;
 constexpr uint16_t kRecordIsDirectory = 0x0002;
 
 // Attribute type codes we care about.
+constexpr uint32_t kAttrStandardInfo    = 0x10;
 constexpr uint32_t kAttrAttributeList   = 0x20;
 constexpr uint32_t kAttrFileName        = 0x30;
 constexpr uint32_t kAttrData            = 0x80;
@@ -89,6 +90,19 @@ struct NonResidentAttribute {
     uint64_t AllocatedSize;     // clusters reserved on disk, in bytes
     uint64_t RealSize;          // logical EOF
     uint64_t InitializedSize;
+};
+
+// Value of a $STANDARD_INFORMATION attribute (always resident, always first).
+// Its ModificationTime is the one Explorer shows as "Date modified"; the copy
+// in $FILE_NAME is updated lazily and is not reliable. All times are FILETIME
+// (100 ns ticks since 1601-01-01 UTC).
+struct StandardInformation {
+    uint64_t CreationTime;      // 0x00
+    uint64_t ModificationTime;  // 0x08  last data write
+    uint64_t MftChangeTime;     // 0x10
+    uint64_t AccessTime;        // 0x18
+    uint32_t FileAttributes;    // 0x20
+    // version-dependent fields follow (quota, USN, ...); not needed here
 };
 
 // Value of a $FILE_NAME attribute (always resident).

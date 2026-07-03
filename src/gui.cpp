@@ -44,8 +44,25 @@
 // ============================================================================
 
 enum TreeColumn : ImGuiID {
-    ColName = 0, ColSize, ColPercent, ColFiles, ColFolders
+    ColName = 0, ColSize, ColPercent, ColFiles, ColFolders, ColModified
 };
+
+// A FILETIME (100 ns since 1601 UTC) as a local "YYYY-MM-DD HH:MM" string;
+// "-" when unknown (0) or unconvertible.
+static std::string FormatTime(uint64_t filetime) {
+    if (filetime == 0) return "-";
+    FILETIME utc, local;
+    utc.dwLowDateTime  = (DWORD)(filetime & 0xFFFFFFFFull);
+    utc.dwHighDateTime = (DWORD)(filetime >> 32);
+    SYSTEMTIME st;
+    if (!FileTimeToLocalFileTime(&utc, &local) ||
+        !FileTimeToSystemTime(&local, &st))
+        return "-";
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d", st.wYear, st.wMonth,
+             st.wDay, st.wHour, st.wMinute);
+    return buf;
+}
 
 struct App {
     std::vector<std::wstring> Drives;
@@ -328,9 +345,10 @@ static void ApplySort(App& app, const ImGuiTableColumnSortSpecs& spec) {
     app.SortedChildren = r.Children.List;
     auto key = [&](uint32_t n) -> uint64_t {
         switch (spec.ColumnUserID) {
-            case ColFiles:   return r.IsDir(n) ? r.Totals[n].FileCount : 0;
-            case ColFolders: return r.IsDir(n) ? r.Totals[n].DirCount : 0;
-            default:         return r.SizeOf(n); // ColSize / ColPercent
+            case ColFiles:    return r.IsDir(n) ? r.Totals[n].FileCount : 0;
+            case ColFolders:  return r.IsDir(n) ? r.Totals[n].DirCount : 0;
+            case ColModified: return r.Nodes[n].ModifiedTime;
+            default:          return r.SizeOf(n); // ColSize / ColPercent
         }
     };
     for (size_t d = 0; d + 1 < r.Children.Offset.size(); ++d) {
@@ -692,6 +710,9 @@ static void DrawTree(App& app, const yadua::ScanResult& r, uint32_t idx,
     ImGui::TableNextColumn();
     if (isDir) ImGui::Text("%llu", r.Totals[idx].DirCount);
 
+    ImGui::TableNextColumn();
+    ImGui::TextUnformatted(FormatTime(r.Nodes[idx].ModifiedTime).c_str());
+
     if (open && !leaf) {
         const uint32_t* list = app.UseSorted ? app.SortedChildren.data()
                                              : r.Children.List.data();
@@ -722,10 +743,10 @@ static void DrawTree(App& app, const yadua::ScanResult& r, uint32_t idx,
 }
 
 static void DrawTreeTable(App& app, const yadua::ScanResult& r) {
-    if (!ImGui::BeginTable("tree", 5,
+    if (!ImGui::BeginTable("tree", 6,
                            ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg |
                            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
-                           ImGuiTableFlags_Sortable))
+                           ImGuiTableFlags_Reorderable | ImGuiTableFlags_Sortable))
         return;
     float ch = ImGui::GetFontSize();
     ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 0, ColName);
@@ -745,6 +766,10 @@ static void DrawTreeTable(App& app, const yadua::ScanResult& r) {
                             ImGuiTableColumnFlags_WidthFixed |
                             ImGuiTableColumnFlags_PreferSortDescending,
                             ch * 5, ColFolders);
+    ImGui::TableSetupColumn("Modified",
+                            ImGuiTableColumnFlags_WidthFixed |
+                            ImGuiTableColumnFlags_PreferSortDescending,
+                            ch * 9, ColModified);
     ImGui::TableSetupScrollFreeze(0, 1);
     ImGui::TableHeadersRow();
 
@@ -851,6 +876,14 @@ static void SortFileList(App& app) {
                       int c = CompareNames(r, a, b);
                       return asc ? c < 0 : c > 0;
                   });
+    else if (app.FileSortCol == ColModified)
+        std::sort(app.FileList.begin(), app.FileList.end(),
+                  [&](uint32_t a, uint32_t b) {
+                      uint64_t ma = r.Nodes[a].ModifiedTime;
+                      uint64_t mb = r.Nodes[b].ModifiedTime;
+                      if (ma != mb) return asc ? ma < mb : ma > mb;
+                      return CompareNames(r, a, b) < 0;
+                  });
     else // ColSize (also the % column, which ranks by size)
         std::sort(app.FileList.begin(), app.FileList.end(),
                   [&](uint32_t a, uint32_t b) {
@@ -886,10 +919,10 @@ static void DrawFilesTab(App& app, const yadua::ScanResult& r) {
                         r.DisplayAllocated ? " on disk" : "",
                         app.Visible.empty() ? "" : "  (filtered)");
 
-    if (!ImGui::BeginTable("files", 4,
+    if (!ImGui::BeginTable("files", 5,
                            ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg |
                            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
-                           ImGuiTableFlags_Sortable))
+                           ImGuiTableFlags_Reorderable | ImGuiTableFlags_Sortable))
         return;
     float ch = ImGui::GetFontSize();
     ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 0, ColName);
@@ -901,6 +934,10 @@ static void DrawFilesTab(App& app, const yadua::ScanResult& r) {
     ImGui::TableSetupColumn("% of volume",
                             ImGuiTableColumnFlags_WidthFixed |
                             ImGuiTableColumnFlags_NoSort, ch * 8, ColPercent);
+    ImGui::TableSetupColumn("Modified",
+                            ImGuiTableColumnFlags_WidthFixed |
+                            ImGuiTableColumnFlags_PreferSortDescending,
+                            ch * 9, ColModified);
     ImGui::TableSetupColumn("Folder",
                             ImGuiTableColumnFlags_WidthStretch |
                             ImGuiTableColumnFlags_NoSort, 0, ColFolders);
@@ -953,6 +990,9 @@ static void DrawFilesTab(App& app, const yadua::ScanResult& r) {
             ImGui::ProgressBar(frac, ImVec2(-FLT_MIN, 0.0f), overlay);
 
             ImGui::TableSetColumnIndex(3);
+            ImGui::TextUnformatted(FormatTime(r.Nodes[idx].ModifiedTime).c_str());
+
+            ImGui::TableSetColumnIndex(4);
             ImGui::TextUnformatted(
                 yadua::Utf8(r.Path(r.Nodes[idx].Parent)).c_str());
 

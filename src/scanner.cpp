@@ -237,7 +237,15 @@ void ParseRecord(uint8_t* rec, uint32_t recordSize, uint64_t recordIndex,
         if (attr->Length < sizeof(AttributeHeader) || offset + attr->Length > limit)
             break;
 
-        if (attr->Type == kAttrFileName && !attr->NonResident && node) {
+        if (attr->Type == kAttrStandardInfo && !attr->NonResident && node) {
+            // The "Date modified" Explorer shows (0x08 into the value). Bounds-
+            // check: value must be resident and reach at least through the time.
+            auto* res = reinterpret_cast<ResidentAttribute*>(attr);
+            if (res->ValueOffset + 16u <= attr->Length &&
+                offset + res->ValueOffset + 16u <= limit)
+                memcpy(&node->ModifiedTime,
+                       rec + offset + res->ValueOffset + 8, 8);
+        } else if (attr->Type == kAttrFileName && !attr->NonResident && node) {
             auto* res = reinterpret_cast<ResidentAttribute*>(attr);
             if (res->ValueOffset + sizeof(FileNameAttribute) <= attr->Length) {
                 auto* fn = reinterpret_cast<FileNameAttribute*>(
@@ -792,6 +800,7 @@ void WalkTree(const std::wstring& rootPath, uint32_t rootNode, unsigned threads,
         uint64_t Size;
         bool IsDir;
         bool IsReparse;
+        uint64_t Modified;
     };
 
     auto worker = [&] {
@@ -821,7 +830,9 @@ void WalkTree(const std::wstring& rootPath, uint32_t rootNode, unsigned threads,
                         {fd.cFileName,
                          ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow,
                          (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0,
-                         (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0});
+                         (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0,
+                         ((uint64_t)fd.ftLastWriteTime.dwHighDateTime << 32) |
+                             fd.ftLastWriteTime.dwLowDateTime});
                 } while (FindNextFileW(find, &fd));
                 FindClose(find);
             }
@@ -837,6 +848,7 @@ void WalkTree(const std::wstring& rootPath, uint32_t rootNode, unsigned threads,
                 n.ParentSeq  = out.Nodes[dirNode].Sequence;
                 n.NameOffset = (uint32_t)out.NameArena.size();
                 n.NameLength = (uint16_t)e.Name.size();
+                n.ModifiedTime = e.Modified;
                 if (e.IsReparse) n.Flags |= kNodeReparse;
                 if (e.IsDir) {
                     n.Flags |= kNodeIsDir;
@@ -1202,12 +1214,20 @@ bool RescanSubtree(ScanResult& r, uint32_t dir, std::wstring& error,
 namespace {
 
 constexpr char     kSnapMagic[8]  = {'Y','A','D','U','A','S','N','P'};
-constexpr uint32_t kSnapVersion   = 1;
+constexpr uint32_t kSnapVersion   = 2; // v2 adds Modified; v1 still readable
 
 #pragma pack(push, 1)
-struct SnapNode {
+struct SnapNode {        // v2
     uint32_t Parent;     // dense index of the parent
     uint8_t  Flags;      // kNodeIsDir | kNodeReparse
+    uint16_t NameChars;
+    uint64_t Logical;
+    uint64_t Allocated;
+    uint64_t Modified;   // last-write FILETIME (0 = unknown)
+};
+struct SnapNodeV1 {      // legacy layout (no Modified)
+    uint32_t Parent;
+    uint8_t  Flags;
     uint16_t NameChars;
     uint64_t Logical;
     uint64_t Allocated;
@@ -1254,7 +1274,8 @@ bool SaveSnapshot(const ScanResult& r, const std::wstring& file,
         const Node& node = r.Nodes[n];
         SnapNode s{n == (uint32_t)kRootRecord ? 0u : dense[node.Parent],
                    (uint8_t)(node.Flags & (kNodeIsDir | kNodeReparse)),
-                   node.NameLength, node.LogicalSize, node.AllocatedSize};
+                   node.NameLength, node.LogicalSize, node.AllocatedSize,
+                   node.ModifiedTime};
         fwrite(&s, sizeof(s), 1, f);
         fwrite(r.NameArena.data() + node.NameOffset, sizeof(wchar_t),
                node.NameLength, f);
@@ -1285,7 +1306,7 @@ bool LoadSnapshot(const std::wstring& file, ScanResult& out,
     uint32_t version = 0;
     if (fread(magic, 1, 8, f) != 8 || memcmp(magic, kSnapMagic, 8) != 0)
         return fail(L"bad magic");
-    if (fread(&version, 4, 1, f) != 1 || version != kSnapVersion)
+    if (fread(&version, 4, 1, f) != 1 || (version != 1 && version != 2))
         return fail(L"unsupported version");
     if (fread(&out.Stats.ScanUnixTime, 8, 1, f) != 1) return fail(L"truncated");
     uint32_t driveChars = 0;
@@ -1304,8 +1325,17 @@ bool LoadSnapshot(const std::wstring& file, ScanResult& out,
     };
     out.Nodes.assign((size_t)kRootRecord + count, Node{});
     for (uint64_t d = 0; d < count; ++d) {
-        SnapNode s;
-        if (fread(&s, sizeof(s), 1, f) != 1) return fail(L"truncated node");
+        // Read the version-appropriate record; v1 has no Modified field.
+        SnapNode s{};
+        if (version >= 2) {
+            if (fread(&s, sizeof(SnapNode), 1, f) != 1)
+                return fail(L"truncated node");
+        } else {
+            SnapNodeV1 v1;
+            if (fread(&v1, sizeof(v1), 1, f) != 1) return fail(L"truncated node");
+            s.Parent = v1.Parent; s.Flags = v1.Flags; s.NameChars = v1.NameChars;
+            s.Logical = v1.Logical; s.Allocated = v1.Allocated; s.Modified = 0;
+        }
         if (s.NameChars > 4096) return fail(L"bad name length");
         if (d > 0 && (s.Parent >= d)) return fail(L"bad parent order");
 
@@ -1316,6 +1346,7 @@ bool LoadSnapshot(const std::wstring& file, ScanResult& out,
         n.ParentSeq  = 1;
         n.LogicalSize   = s.Logical;
         n.AllocatedSize = s.Allocated;
+        n.ModifiedTime  = s.Modified;
         n.NameOffset = (uint32_t)out.NameArena.size();
         n.NameLength = s.NameChars;
         size_t old = out.NameArena.size();
