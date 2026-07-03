@@ -153,8 +153,9 @@
       `$STANDARD_INFORMATION` (offset 0x20) and the walk fallback, shown as
       R/H/S/A/C/E letters in the Tree and Files views (hidden by default) and
       in CSV exports. (Owner column deferred - needs per-file security lookups.)
-- [ ] **In-GUI compare/history** view over snapshots (the CLI already does
-      `--snapshot` / `--diff`; surface it in the UI)
+- [~] **In-GUI snapshots**: File ▸ Export ▸ Save snapshot (.ysnap) done
+      (background-threaded). The compare/diff **view** is deferred - it's a
+      new UI that wants design + eyes-on review; `--diff` stays in the CLI.
 - [x] **Custom right-click commands** (WinDirStat-style cleanup actions):
       `%LOCALAPPDATA%\YADUA\commands.txt` holds "Label|command" lines (%1 = the
       selected path); they appear under a "Commands" submenu and run via

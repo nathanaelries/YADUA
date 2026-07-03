@@ -1387,7 +1387,8 @@ static bool WriteFilesCsv(const yadua::ScanResult& r,
 // timestamp (no colons - those are illegal in Windows filenames - and a Z so
 // files from machines in different timezones still sort chronologically), and
 // the scanned drive. e.g. WIN-DB01_YADUA_tree_C_20260703T142530Z.csv
-static std::wstring DefaultExportName(const App& app, const wchar_t* what) {
+static std::wstring DefaultExportName(const App& app, const wchar_t* what,
+                                      const wchar_t* ext) {
     wchar_t host[MAX_COMPUTERNAME_LENGTH + 1] = L"UNKNOWN";
     DWORD hn = (DWORD)(sizeof(host) / sizeof(host[0]));
     GetComputerNameW(host, &hn);
@@ -1410,30 +1411,34 @@ static std::wstring DefaultExportName(const App& app, const wchar_t* what) {
     if (!letter.empty()) name += L"_" + letter;
     name += L"_";
     name += ts;
-    name += L".csv";
+    name += L".";
+    name += ext;
     return name;
 }
 
-// Standard Save-As dialog (runs on the UI thread). Returns false if cancelled.
-static bool SaveCsvDialog(HWND owner, const wchar_t* title,
-                          const wchar_t* defName, std::wstring& out) {
+// Standard Save-As dialog (runs on the UI thread). `filter` is a double-null
+// terminated OPENFILENAME filter. Returns false if cancelled.
+static bool SaveFileDialog(HWND owner, const wchar_t* title,
+                           const wchar_t* filter, const wchar_t* defExt,
+                           const wchar_t* defName, std::wstring& out) {
     wchar_t buf[MAX_PATH];
     wcsncpy_s(buf, defName, _TRUNCATE);
     OPENFILENAMEW ofn{};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner   = owner;
-    ofn.lpstrFilter = L"CSV files\0*.csv\0All files\0*.*\0";
+    ofn.lpstrFilter = filter;
     ofn.lpstrFile   = buf;
     ofn.nMaxFile    = MAX_PATH;
     ofn.lpstrTitle  = title;
-    ofn.lpstrDefExt = L"csv";
+    ofn.lpstrDefExt = defExt;
     ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
     if (!GetSaveFileNameW(&ofn)) return false;
     out = buf;
     return true;
 }
 
-// kind 0 = full tree, 1 = the current (filtered) file list.
+// kind 0 = full tree CSV, 1 = the current (filtered) file list CSV,
+// 2 = binary snapshot (.ysnap).
 static void StartExport(App& app, int kind, const std::wstring& path) {
     if (app.Exporting || app.Scanning || app.Rescanning || app.Deleting ||
         !app.Result)
@@ -1452,7 +1457,8 @@ static void StartExport(App& app, int kind, const std::wstring& path) {
     yadua::ScanResult* r = app.Result.get();
     app.ExportThread = std::thread([&app, r, path, kind, files] {
         std::wstring err;
-        bool ok = kind == 1 ? WriteFilesCsv(*r, files, path, err)
+        bool ok = kind == 2 ? yadua::SaveSnapshot(*r, path, err)
+                : kind == 1 ? WriteFilesCsv(*r, files, path, err)
                             : WriteTreeCsv(*r, path, err);
         if (!ok) app.ExportError = err;
         app.ExportDone = true;
@@ -1513,19 +1519,27 @@ static void DrawMenuBar(App& app) {
         }
         ImGui::Separator();
         if (ImGui::BeginMenu("Export", app.Result && !busy)) {
+            const wchar_t* csvFilter = L"CSV files\0*.csv\0All files\0*.*\0";
             if (ImGui::MenuItem("Full tree to CSV...")) {
-                std::wstring def = DefaultExportName(app, L"tree");
-                std::wstring path;
-                if (SaveCsvDialog(app.MainWindow, L"Export full tree to CSV",
-                                  def.c_str(), path))
+                std::wstring def = DefaultExportName(app, L"tree", L"csv"), path;
+                if (SaveFileDialog(app.MainWindow, L"Export full tree to CSV",
+                                   csvFilter, L"csv", def.c_str(), path))
                     StartExport(app, 0, path);
             }
             if (ImGui::MenuItem("File list to CSV...")) {
-                std::wstring def = DefaultExportName(app, L"files");
-                std::wstring path;
-                if (SaveCsvDialog(app.MainWindow, L"Export file list to CSV",
-                                  def.c_str(), path))
+                std::wstring def = DefaultExportName(app, L"files", L"csv"), path;
+                if (SaveFileDialog(app.MainWindow, L"Export file list to CSV",
+                                   csvFilter, L"csv", def.c_str(), path))
                     StartExport(app, 1, path);
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Save snapshot (.ysnap)...")) {
+                std::wstring def = DefaultExportName(app, L"snapshot", L"ysnap"),
+                             path;
+                if (SaveFileDialog(app.MainWindow, L"Save scan snapshot",
+                                   L"YADUA snapshot\0*.ysnap\0All files\0*.*\0",
+                                   L"ysnap", def.c_str(), path))
+                    StartExport(app, 2, path);
             }
             ImGui::EndMenu();
         }
