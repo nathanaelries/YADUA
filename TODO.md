@@ -158,6 +158,8 @@
 - [~] **In-GUI snapshots**: File ▸ Export ▸ Save snapshot (.ysnap) done
       (background-threaded). The compare/diff **view** is deferred - it's a
       new UI that wants design + eyes-on review; `--diff` stays in the CLI.
+- [x] **Treemap color legend** (WinDirStat-style): the full-screen Treemap tab
+      shows a one-line key of the biggest file types with their hue swatches.
 - [x] **Custom right-click commands** (WinDirStat-style cleanup actions):
       `%LOCALAPPDATA%\YADUA\commands.txt` holds "Label|command" lines (%1 = the
       selected path); they appear under a "Commands" submenu and run via

@@ -1673,6 +1673,33 @@ static void HandleShortcuts(App& app) {
     }
 }
 
+// A color key for the treemap: the biggest file types with their hue swatches
+// (WinDirStat-style), so the map is readable at a glance. Wraps to fit width.
+static void DrawTreemapLegend(App& app) {
+    if (app.TypeListDirty) RebuildTypeList(app);
+    float right = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
+    float sq = ImGui::GetTextLineHeight() * 0.72f;
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextDisabled("Types:");
+    int shown = 0;
+    for (const App::TypeAgg& t : app.TypeList) {
+        if (shown >= 18) break;
+        if (t.Ext.empty()) continue;
+        std::string lbl = "." + yadua::Utf8(t.Ext);
+        float need = sq + 4 + ImGui::CalcTextSize(lbl.c_str()).x + 12;
+        ImGui::SameLine();
+        if (ImGui::GetCursorScreenPos().x + need > right) break; // one row, no clip
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        float pad = (ImGui::GetTextLineHeight() - sq) * 0.5f;
+        ImGui::GetWindowDrawList()->AddRectFilled(
+            ImVec2(p.x, p.y + pad), ImVec2(p.x + sq, p.y + pad + sq),
+            ExtHueColor(t.Ext, 0.78f, 0.88f), 2.0f);
+        ImGui::SetCursorScreenPos(ImVec2(p.x + sq + 4, p.y));
+        ImGui::TextUnformatted(lbl.c_str());
+        ++shown;
+    }
+}
+
 // ============================================================================
 // Top-level UI
 // ============================================================================
@@ -1855,11 +1882,18 @@ static void DrawUi(App& app) {
                                     app.OpenTreemap || app.SwitchToTreemap
                                         ? ImGuiTabItemFlags_SetSelected : 0)) {
                 app.OpenTreemap = app.SwitchToTreemap = false;
+                // Reserve a one-line color key below the map.
+                float legendH = ImGui::GetTextLineHeightWithSpacing() + 4;
+                ImGui::BeginChild("##tmcanvas",
+                                  ImVec2(0, ImGui::GetContentRegionAvail().y -
+                                                legendH));
                 app.Treemap.Draw(*app.Result, [&](uint32_t node) {
                     NodeMenuItems(app, *app.Result, node, true);
                 });
                 uint32_t clicked = app.Treemap.ConsumeClicked();
                 if (clicked != UINT32_MAX) app.SelectedNode = clicked;
+                ImGui::EndChild();
+                DrawTreemapLegend(app);
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
