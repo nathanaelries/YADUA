@@ -35,6 +35,7 @@ struct Node {
     uint8_t  Flags         = 0; // kNode* bits below
     uint8_t  NameRank      = 0xFF; // namespace preference of the stored name
     uint8_t  ThreadId      = 0; // which worker's arena held the name (internal)
+    uint32_t Attributes    = 0; // Win32 FILE_ATTRIBUTE_* (fits in the tail pad)
 };
 
 constexpr uint8_t kNodeInUse   = 0x01;

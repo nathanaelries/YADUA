@@ -73,21 +73,36 @@ struct TopLists {
     size_t FileCount = 0;
 };
 
+// Win32 file attributes as compact letters (R/H/S/A/C/E).
+static std::string AttrString(uint32_t a) {
+    std::string s;
+    if (a & 0x00000001u) s += 'R';
+    if (a & 0x00000002u) s += 'H';
+    if (a & 0x00000004u) s += 'S';
+    if (a & 0x00000020u) s += 'A';
+    if (a & 0x00000800u) s += 'C';
+    if (a & 0x00004000u) s += 'E';
+    return s;
+}
+
 static void ExportCsv(FILE* f, const ScanResult& r, const TopLists& top,
                       bool fullTree) {
     fputs("\xEF\xBB\xBF", f); // UTF-8 BOM so Excel decodes correctly
-    fputs("type,path,size_bytes,allocated_bytes,files,folders,modified\n", f);
+    fputs("type,path,size_bytes,allocated_bytes,files,folders,modified,"
+          "attributes\n", f);
 
     auto folderRow = [&](const std::string& path, uint32_t idx) {
-        fprintf(f, "folder,%s,%llu,%llu,%llu,%llu,%s\n", CsvEscape(path).c_str(),
+        fprintf(f, "folder,%s,%llu,%llu,%llu,%llu,%s,%s\n", CsvEscape(path).c_str(),
                 r.Totals[idx].LogicalSize, r.Totals[idx].AllocatedSize,
                 r.Totals[idx].FileCount, r.Totals[idx].DirCount,
-                IsoTime(r.Nodes[idx].ModifiedTime).c_str());
+                IsoTime(r.Nodes[idx].ModifiedTime).c_str(),
+                AttrString(r.Nodes[idx].Attributes).c_str());
     };
     auto fileRow = [&](const std::string& path, uint32_t idx) {
-        fprintf(f, "file,%s,%llu,%llu,,,%s\n", CsvEscape(path).c_str(),
+        fprintf(f, "file,%s,%llu,%llu,,,%s,%s\n", CsvEscape(path).c_str(),
                 r.Nodes[idx].LogicalSize, r.Nodes[idx].AllocatedSize,
-                IsoTime(r.Nodes[idx].ModifiedTime).c_str());
+                IsoTime(r.Nodes[idx].ModifiedTime).c_str(),
+                AttrString(r.Nodes[idx].Attributes).c_str());
     };
 
     if (!fullTree) {

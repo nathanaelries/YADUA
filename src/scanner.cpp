@@ -247,10 +247,14 @@ void ParseRecord(uint8_t* rec, uint32_t recordSize, uint64_t recordIndex,
             // The "Date modified" Explorer shows (0x08 into the value). Bounds-
             // check: value must be resident and reach at least through the time.
             auto* res = reinterpret_cast<ResidentAttribute*>(attr);
+            const uint8_t* v = rec + offset + res->ValueOffset;
             if (res->ValueOffset + 16u <= attr->Length &&
                 offset + res->ValueOffset + 16u <= limit)
-                memcpy(&node->ModifiedTime,
-                       rec + offset + res->ValueOffset + 8, 8);
+                memcpy(&node->ModifiedTime, v + 8, 8); // last-write FILETIME
+            // FileAttributes live at value offset 0x20 (needs 36 resident bytes).
+            if (res->ValueOffset + 36u <= attr->Length &&
+                offset + res->ValueOffset + 36u <= limit)
+                memcpy(&node->Attributes, v + 32, 4);
         } else if (attr->Type == kAttrFileName && !attr->NonResident && node) {
             auto* res = reinterpret_cast<ResidentAttribute*>(attr);
             if (res->ValueOffset + sizeof(FileNameAttribute) <= attr->Length) {
@@ -816,6 +820,7 @@ void WalkTree(const std::wstring& rootPath, uint32_t rootNode, unsigned threads,
         bool IsDir;
         bool IsReparse;
         uint64_t Modified;
+        uint32_t Attributes;
     };
 
     auto worker = [&] {
@@ -847,7 +852,8 @@ void WalkTree(const std::wstring& rootPath, uint32_t rootNode, unsigned threads,
                          (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0,
                          (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0,
                          ((uint64_t)fd.ftLastWriteTime.dwHighDateTime << 32) |
-                             fd.ftLastWriteTime.dwLowDateTime});
+                             fd.ftLastWriteTime.dwLowDateTime,
+                         fd.dwFileAttributes});
                 } while (FindNextFileW(find, &fd));
                 FindClose(find);
             }
@@ -864,6 +870,7 @@ void WalkTree(const std::wstring& rootPath, uint32_t rootNode, unsigned threads,
                 n.NameOffset = (uint32_t)out.NameArena.size();
                 n.NameLength = (uint16_t)e.Name.size();
                 n.ModifiedTime = e.Modified;
+                n.Attributes = e.Attributes;
                 if (e.IsReparse) n.Flags |= kNodeReparse;
                 if (e.IsDir) {
                     n.Flags |= kNodeIsDir;

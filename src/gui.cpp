@@ -47,8 +47,21 @@
 
 enum TreeColumn : ImGuiID {
     ColName = 0, ColSize, ColPercent, ColFiles, ColFolders, ColModified,
-    ColAllocated
+    ColAllocated, ColAttributes
 };
+
+// Win32 file attributes as compact letters (WizTree-style): Read-only, Hidden,
+// System, Archive, Compressed, Encrypted. Empty when none are set.
+static std::string AttrString(uint32_t a) {
+    std::string s;
+    if (a & 0x00000001u) s += 'R'; // FILE_ATTRIBUTE_READONLY
+    if (a & 0x00000002u) s += 'H'; // HIDDEN
+    if (a & 0x00000004u) s += 'S'; // SYSTEM
+    if (a & 0x00000020u) s += 'A'; // ARCHIVE
+    if (a & 0x00000800u) s += 'C'; // COMPRESSED
+    if (a & 0x00004000u) s += 'E'; // ENCRYPTED
+    return s;
+}
 
 // A FILETIME (100 ns since 1601 UTC) as a local "YYYY-MM-DD HH:MM" string;
 // "-" when unknown (0) or unconvertible.
@@ -739,6 +752,9 @@ static void DrawTree(App& app, const yadua::ScanResult& r, uint32_t idx,
     ImGui::TextUnformatted(yadua::HumanSize(
         isDir ? r.Totals[idx].AllocatedSize : r.Nodes[idx].AllocatedSize).c_str());
 
+    ImGui::TableNextColumn();
+    ImGui::TextUnformatted(AttrString(r.Nodes[idx].Attributes).c_str());
+
     if (open && !leaf) {
         const uint32_t* list = app.UseSorted ? app.SortedChildren.data()
                                              : r.Children.List.data();
@@ -773,7 +789,7 @@ static void DrawTree(App& app, const yadua::ScanResult& r, uint32_t idx,
 }
 
 static void DrawTreeTable(App& app, const yadua::ScanResult& r) {
-    if (!ImGui::BeginTable("tree", 7,
+    if (!ImGui::BeginTable("tree", 8,
                            ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg |
                            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
                            ImGuiTableFlags_Reorderable | ImGuiTableFlags_Hideable |
@@ -806,6 +822,10 @@ static void DrawTreeTable(App& app, const yadua::ScanResult& r) {
                             ImGuiTableColumnFlags_DefaultHide |
                             ImGuiTableColumnFlags_PreferSortDescending,
                             ch * 6, ColAllocated);
+    ImGui::TableSetupColumn("Attr",
+                            ImGuiTableColumnFlags_WidthFixed |
+                            ImGuiTableColumnFlags_DefaultHide |
+                            ImGuiTableColumnFlags_NoSort, ch * 4, ColAttributes);
     ImGui::TableSetupScrollFreeze(0, 1);
     ImGui::TableHeadersRow();
 
@@ -968,7 +988,7 @@ static void DrawFilesTab(App& app, const yadua::ScanResult& r) {
                         r.DisplayAllocated ? " on disk" : "",
                         app.Visible.empty() ? "" : "  (filtered)");
 
-    if (!ImGui::BeginTable("files", 6,
+    if (!ImGui::BeginTable("files", 7,
                            ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg |
                            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
                            ImGuiTableFlags_Reorderable | ImGuiTableFlags_Hideable |
@@ -996,6 +1016,10 @@ static void DrawFilesTab(App& app, const yadua::ScanResult& r) {
                             ImGuiTableColumnFlags_DefaultHide |
                             ImGuiTableColumnFlags_PreferSortDescending,
                             ch * 6, ColAllocated);
+    ImGui::TableSetupColumn("Attr",
+                            ImGuiTableColumnFlags_WidthFixed |
+                            ImGuiTableColumnFlags_DefaultHide |
+                            ImGuiTableColumnFlags_NoSort, ch * 4, ColAttributes);
     ImGui::TableSetupScrollFreeze(0, 1);
     ImGui::TableHeadersRow();
 
@@ -1054,6 +1078,9 @@ static void DrawFilesTab(App& app, const yadua::ScanResult& r) {
             ImGui::TableSetColumnIndex(5);
             ImGui::TextUnformatted(
                 yadua::HumanSize(r.Nodes[idx].AllocatedSize).c_str());
+
+            ImGui::TableSetColumnIndex(6);
+            ImGui::TextUnformatted(AttrString(r.Nodes[idx].Attributes).c_str());
 
             ImGui::PopID();
         }
@@ -1170,17 +1197,19 @@ static bool WriteTreeCsv(const yadua::ScanResult& r, const std::wstring& path,
     if (!f) { err = L"cannot create " + path; return false; }
     setvbuf(f, nullptr, _IOFBF, 1 << 20);
     fputs("\xEF\xBB\xBF", f); // UTF-8 BOM for Excel
-    fputs("type,path,size_bytes,allocated_bytes,files,folders,modified\n", f);
+    fputs("type,path,size_bytes,allocated_bytes,files,folders,modified,"
+          "attributes\n", f);
     std::wstring cur = r.Drive;
     std::function<void(uint32_t)> walk = [&](uint32_t idx) {
         if (r.IsDir(idx)) {
-            fprintf(f, "folder,%s,%llu,%llu,%llu,%llu,%s\n",
+            fprintf(f, "folder,%s,%llu,%llu,%llu,%llu,%s,%s\n",
                     CsvEsc(yadua::Utf8(cur)).c_str(),
                     (unsigned long long)r.Totals[idx].LogicalSize,
                     (unsigned long long)r.Totals[idx].AllocatedSize,
                     (unsigned long long)r.Totals[idx].FileCount,
                     (unsigned long long)r.Totals[idx].DirCount,
-                    FormatTime(r.Nodes[idx].ModifiedTime).c_str());
+                    FormatTime(r.Nodes[idx].ModifiedTime).c_str(),
+                    AttrString(r.Nodes[idx].Attributes).c_str());
             for (uint32_t c = r.Children.Offset[idx];
                  c < r.Children.Offset[idx + 1]; ++c) {
                 uint32_t child = r.Children.List[c];
@@ -1192,10 +1221,12 @@ static bool WriteTreeCsv(const yadua::ScanResult& r, const std::wstring& path,
                 cur.resize(len);
             }
         } else {
-            fprintf(f, "file,%s,%llu,%llu,,,%s\n", CsvEsc(yadua::Utf8(cur)).c_str(),
+            fprintf(f, "file,%s,%llu,%llu,,,%s,%s\n",
+                    CsvEsc(yadua::Utf8(cur)).c_str(),
                     (unsigned long long)r.Nodes[idx].LogicalSize,
                     (unsigned long long)r.Nodes[idx].AllocatedSize,
-                    FormatTime(r.Nodes[idx].ModifiedTime).c_str());
+                    FormatTime(r.Nodes[idx].ModifiedTime).c_str(),
+                    AttrString(r.Nodes[idx].Attributes).c_str());
         }
     };
     walk((uint32_t)yadua::kRootRecord);
@@ -1213,14 +1244,15 @@ static bool WriteFilesCsv(const yadua::ScanResult& r,
     if (!f) { err = L"cannot create " + path; return false; }
     setvbuf(f, nullptr, _IOFBF, 1 << 20);
     fputs("\xEF\xBB\xBF", f);
-    fputs("name,size_bytes,allocated_bytes,modified,folder\n", f);
+    fputs("name,size_bytes,allocated_bytes,modified,attributes,folder\n", f);
     for (uint32_t idx : files) {
         if (!r.Exists(idx)) continue;
-        fprintf(f, "%s,%llu,%llu,%s,%s\n",
+        fprintf(f, "%s,%llu,%llu,%s,%s,%s\n",
                 CsvEsc(yadua::Utf8(r.Name(idx))).c_str(),
                 (unsigned long long)r.Nodes[idx].LogicalSize,
                 (unsigned long long)r.Nodes[idx].AllocatedSize,
                 FormatTime(r.Nodes[idx].ModifiedTime).c_str(),
+                AttrString(r.Nodes[idx].Attributes).c_str(),
                 CsvEsc(yadua::Utf8(r.Path(r.Nodes[idx].Parent))).c_str());
     }
     bool ok = !ferror(f);
