@@ -48,8 +48,11 @@ A standard menu bar (**File / Edit / View / Search / Tools / Help**) exposes
 every action; the toolbar keeps just the drive picker, Scan, and the filter
 box. Keyboard: `Ctrl+R` scan, `Ctrl+F` find, `Del` recycle the selection,
 `Esc` clear the filter. **File ▸ Export** writes the full tree or the current
-file list to CSV (on a background thread, so a big volume won't stall the UI).
-The window position/size and last-scanned drive are remembered between runs.
+file list to CSV (on a background thread, so a big volume won't stall the UI);
+the default name embeds the host, drive, and a UTC timestamp
+(`HOST_YADUA_tree_C_20260703T142530Z.csv`) so exports collected from many
+machines to one share stay self-identifying. The window position/size and
+last-scanned drive are remembered between runs.
 
 - **Tree tab** — sortable, reorderable columns (Name, Size, % of parent,
   Files, Folders, Modified, and an optional Allocated column — click a header

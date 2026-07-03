@@ -1229,6 +1229,38 @@ static bool WriteFilesCsv(const yadua::ScanResult& r,
     return ok;
 }
 
+// A self-describing default export name for fleet collection: which machine,
+// which volume, what, and when. Uses the host name, a UTC ISO-8601 "basic"
+// timestamp (no colons - those are illegal in Windows filenames - and a Z so
+// files from machines in different timezones still sort chronologically), and
+// the scanned drive. e.g. WIN-DB01_YADUA_tree_C_20260703T142530Z.csv
+static std::wstring DefaultExportName(const App& app, const wchar_t* what) {
+    wchar_t host[MAX_COMPUTERNAME_LENGTH + 1] = L"UNKNOWN";
+    DWORD hn = (DWORD)(sizeof(host) / sizeof(host[0]));
+    GetComputerNameW(host, &hn);
+    std::wstring h = host;
+    for (wchar_t& c : h)
+        if (wcschr(L"\\/:*?\"<>| ", c)) c = L'_'; // keep it filename-safe
+
+    std::wstring drive = app.Result ? app.Result->Drive
+                         : app.Drives.empty() ? std::wstring()
+                                              : app.Drives[app.DriveIndex];
+    std::wstring letter = drive.empty() ? std::wstring() : drive.substr(0, 1);
+
+    SYSTEMTIME st;
+    GetSystemTime(&st); // UTC
+    wchar_t ts[24];
+    swprintf_s(ts, L"%04u%02u%02uT%02u%02u%02uZ", st.wYear, st.wMonth, st.wDay,
+               st.wHour, st.wMinute, st.wSecond);
+
+    std::wstring name = h + L"_YADUA_" + what;
+    if (!letter.empty()) name += L"_" + letter;
+    name += L"_";
+    name += ts;
+    name += L".csv";
+    return name;
+}
+
 // Standard Save-As dialog (runs on the UI thread). Returns false if cancelled.
 static bool SaveCsvDialog(HWND owner, const wchar_t* title,
                           const wchar_t* defName, std::wstring& out) {
@@ -1324,15 +1356,17 @@ static void DrawMenuBar(App& app) {
         ImGui::Separator();
         if (ImGui::BeginMenu("Export", app.Result && !busy)) {
             if (ImGui::MenuItem("Full tree to CSV...")) {
+                std::wstring def = DefaultExportName(app, L"tree");
                 std::wstring path;
                 if (SaveCsvDialog(app.MainWindow, L"Export full tree to CSV",
-                                  L"yadua-tree.csv", path))
+                                  def.c_str(), path))
                     StartExport(app, 0, path);
             }
             if (ImGui::MenuItem("File list to CSV...")) {
+                std::wstring def = DefaultExportName(app, L"files");
                 std::wstring path;
                 if (SaveCsvDialog(app.MainWindow, L"Export file list to CSV",
-                                  L"yadua-files.csv", path))
+                                  def.c_str(), path))
                     StartExport(app, 1, path);
             }
             ImGui::EndMenu();
