@@ -40,10 +40,19 @@ ImU32 FileColor(const ScanResult& r, uint32_t node) {
     return ImColor(ImColor::HSV(hue, sat, val));
 }
 
-constexpr ImU32 kDirFill    = IM_COL32(36, 37, 44, 255);
-constexpr ImU32 kDirBorder  = IM_COL32(80, 82, 95, 255);
-constexpr ImU32 kRestFill   = IM_COL32(70, 71, 78, 255);
-// A faint pure-white hairline between file rects so adjacent similar hues stay
+// A muted, per-directory tint for a "N smaller items" lump, so the treemap's
+// unresolvable-detail areas read as subdued color instead of one flat grey.
+ImU32 RestColor(uint32_t dirNode) {
+    uint32_t h = dirNode * 2654435761u; // Knuth multiplicative hash
+    float hue = (float)(h % 360u) / 360.0f;
+    return ImColor(ImColor::HSV(hue, 0.38f, 0.45f));
+}
+
+// Directory fill kept close to the app background so the gaps between colored
+// children read as clean separators, not a grey grid.
+constexpr ImU32 kDirFill    = IM_COL32(22, 23, 28, 255);
+constexpr ImU32 kDirBorder  = IM_COL32(64, 66, 78, 255);
+// A faint pure-white hairline between rects so adjacent similar hues stay
 // visually separable (the "which is which" problem).
 constexpr ImU32 kFileBorder = IM_COL32(255, 255, 255, 55);
 
@@ -218,7 +227,9 @@ void TreemapView::Draw(const ScanResult& r,
     dl->PushClipRect(origin, {origin.x + size.x, origin.y + size.y}, true);
     for (const Item& it : items_) {
         if (it.RestCount) {
-            dl->AddRectFilled(it.Min, it.Max, kRestFill);
+            dl->AddRectFilled(it.Min, it.Max, RestColor(it.Node));
+            if (it.Max.x - it.Min.x > 4 && it.Max.y - it.Min.y > 4)
+                dl->AddRect(it.Min, it.Max, kFileBorder);
         } else if (it.IsDir) {
             dl->AddRectFilled(it.Min, it.Max, kDirFill);
             dl->AddRect(it.Min, it.Max, kDirBorder);
