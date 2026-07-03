@@ -100,3 +100,34 @@
       directory-walk baseline (WinDirStat-style technique), and WizTree's
       CSV export when installed. Measured here: MFT 3.8 s vs walk 35 s
       for 1.2M files
+- [x] Standard menu bar (File / Edit / View / Search / Tools / Help) with
+      keyboard shortcuts (Ctrl+R, Ctrl+F, Del, Esc); the toolbar keeps only
+      the drive picker, Scan, and filter. Retired the cryptic "Apply" and
+      "About" toolbar buttons.
+
+## Phase 4 — WizTree / WinDirStat competitive parity
+
+- [x] "Size on disk" (allocated) toggle: View menu flips the tree, treemap,
+      Files/File Types, and totals between logical size and bytes reserved on
+      disk (the choice is remembered)
+- [ ] **Modified-date column** (and created/accessed): capture the
+      `$STANDARD_INFORMATION` timestamps while parsing MFT records into `Node`,
+      surface a sortable Date Modified column in the tree + Files views, and
+      bump the snapshot format. (Both WizTree and WinDirStat show dates; this
+      is the biggest single gap. Touches scanner + snapshot + GUI.)
+- [ ] **Export from the GUI** (File ▸ Export): dump the current tree or the
+      Files list to CSV/JSON, reusing the CLI's export code path. WizTree
+      exports from its UI; today YADUA only exports from the console.
+- [ ] **Scan a specific folder / path**, not just a whole volume (File ▸ Scan
+      folder...), via the directory-walk scanner rooted at the chosen path
+- [ ] **Allocated column alongside Size**, plus show/hide + reorder columns
+      (WizTree and WinDirStat both let you pick columns)
+- [ ] **Multi-select** in the tree and Files list for bulk delete / export
+- [ ] **Free / unused space** surfaced in the totals and as a slice in the
+      treemap (WizTree shows free space and MFT/overhead)
+- [ ] **File attributes / owner** columns (H/S/R/A, compressed, encrypted)
+- [ ] **In-GUI compare/history** view over snapshots (the CLI already does
+      `--snapshot` / `--diff`; surface it in the UI)
+- [ ] **Custom "open with" / user commands** on a selection (WinDirStat's
+      configurable cleanup actions)
+- [ ] Remember window size/position and the last-scanned drive across runs

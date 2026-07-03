@@ -77,6 +77,7 @@ struct App {
     bool                 SwitchToTreemap  = false;
     bool                 SwitchToFileTypes = false; // View menu -> File Types tab
     bool                 FocusFilter      = false;  // Search/Ctrl+F -> filter box
+    bool                 ShowAllocated    = false;  // show size on disk (persisted)
 
     // Tree sorting. The scanner's child index is size-descending (canonical);
     // any other order lives in SortedChildren (parallel to Children.List).
@@ -505,8 +506,9 @@ static void LoadSettings(App& app) {
         size_t eq = s.find('=');
         if (eq == std::string::npos) continue;
         std::string key = s.substr(0, eq), val = s.substr(eq + 1);
-        if (key == "checkOnLaunch") app.UpdCheckOnLaunch = (val != "0");
-        else if (key == "skip")     app.UpdSkipVersion = yadua::Wide(val);
+        if (key == "checkOnLaunch")       app.UpdCheckOnLaunch = (val != "0");
+        else if (key == "skip")           app.UpdSkipVersion = yadua::Wide(val);
+        else if (key == "showAllocated")  app.ShowAllocated = (val != "0");
     }
     fclose(f);
 }
@@ -518,6 +520,7 @@ static void SaveSettings(App& app) {
     if (!f) return;
     fprintf(f, "checkOnLaunch=%d\n", app.UpdCheckOnLaunch ? 1 : 0);
     fprintf(f, "skip=%s\n", yadua::Utf8(app.UpdSkipVersion).c_str());
+    fprintf(f, "showAllocated=%d\n", app.ShowAllocated ? 1 : 0);
     fclose(f);
 }
 
@@ -851,8 +854,8 @@ static void SortFileList(App& app) {
     else // ColSize (also the % column, which ranks by size)
         std::sort(app.FileList.begin(), app.FileList.end(),
                   [&](uint32_t a, uint32_t b) {
-                      uint64_t sa = r.Nodes[a].LogicalSize;
-                      uint64_t sb = r.Nodes[b].LogicalSize;
+                      uint64_t sa = r.SizeOf(a);
+                      uint64_t sb = r.SizeOf(b);
                       if (sa != sb) return asc ? sa < sb : sa > sb;
                       return CompareNames(r, a, b) < 0; // stable-ish tiebreak
                   });
@@ -868,7 +871,7 @@ static void RebuildFileList(App& app) {
         if (!r.Exists(i) || r.IsDir(i)) continue;
         if (filtered && !app.Visible[i]) continue;
         app.FileList.push_back(i);
-        app.FileListBytes += r.Nodes[i].LogicalSize;
+        app.FileListBytes += r.SizeOf(i);
     }
     SortFileList(app);
     app.FileListDirty = false;
@@ -876,10 +879,11 @@ static void RebuildFileList(App& app) {
 
 static void DrawFilesTab(App& app, const yadua::ScanResult& r) {
     if (app.FileListDirty) RebuildFileList(app);
-    uint64_t volTotal = r.Totals[yadua::kRootRecord].LogicalSize;
+    uint64_t volTotal = r.SizeOf(yadua::kRootRecord);
 
-    ImGui::TextDisabled("%zu files, %s total%s", app.FileList.size(),
+    ImGui::TextDisabled("%zu files, %s total%s%s", app.FileList.size(),
                         yadua::HumanSize(app.FileListBytes).c_str(),
+                        r.DisplayAllocated ? " on disk" : "",
                         app.Visible.empty() ? "" : "  (filtered)");
 
     if (!ImGui::BeginTable("files", 4,
@@ -938,12 +942,11 @@ static void DrawFilesTab(App& app, const yadua::ScanResult& r) {
             }
 
             ImGui::TableSetColumnIndex(1);
-            ImGui::TextUnformatted(
-                yadua::HumanSize(r.Nodes[idx].LogicalSize).c_str());
+            ImGui::TextUnformatted(yadua::HumanSize(r.SizeOf(idx)).c_str());
 
             ImGui::TableSetColumnIndex(2);
             float frac = volTotal
-                ? (float)((double)r.Nodes[idx].LogicalSize / (double)volTotal)
+                ? (float)((double)r.SizeOf(idx) / (double)volTotal)
                 : 0.0f;
             char overlay[16];
             snprintf(overlay, sizeof(overlay), "%.2f%%", frac * 100.0);
@@ -970,7 +973,7 @@ static void RebuildTypeList(App& app) {
         std::wstring ext = FileExt(r, i);
         App::TypeAgg& a = agg[ext];
         a.Ext    = ext;
-        a.Bytes += r.Nodes[i].LogicalSize;
+        a.Bytes += r.SizeOf(i);
         a.Count += 1;
     }
     app.TypeList.clear();
@@ -985,7 +988,7 @@ static void RebuildTypeList(App& app) {
 
 static void DrawTypesTab(App& app, const yadua::ScanResult& r) {
     if (app.TypeListDirty) RebuildTypeList(app);
-    uint64_t volTotal = r.Totals[yadua::kRootRecord].LogicalSize;
+    uint64_t volTotal = r.SizeOf(yadua::kRootRecord);
 
     ImGui::TextDisabled("%zu file types%s  -  click a row to filter to it",
                         app.TypeList.size(),
@@ -1061,6 +1064,16 @@ static bool HasSelection(const App& app, uint32_t& sel) {
     return r && sel != UINT32_MAX && sel < r->Nodes.size() && r->Exists(sel);
 }
 
+// Push the logical/allocated ("size on disk") display mode into the shared
+// result so the tree, treemap, and both summaries switch together, and mark
+// the cached views stale.
+static void ApplySizeMode(App& app) {
+    if (app.Result) app.Result->DisplayAllocated = app.ShowAllocated;
+    app.Treemap.Invalidate();
+    app.FileListDirty = true;
+    app.TypeListDirty = true;
+}
+
 static void DrawMenuBar(App& app) {
     yadua::ScanResult* r = app.Result.get();
     const bool busy = app.Scanning || app.Deleting || app.Rescanning ||
@@ -1105,6 +1118,16 @@ static void DrawMenuBar(App& app) {
     }
 
     if (ImGui::BeginMenu("View")) {
+        if (ImGui::MenuItem("Size on disk (allocated)", nullptr,
+                            app.ShowAllocated)) {
+            app.ShowAllocated = !app.ShowAllocated;
+            ApplySizeMode(app);
+            SaveSettings(app);
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+            ImGui::SetTooltip("Show bytes actually reserved on disk (allocated,\n"
+                              "cluster-rounded) instead of logical file size.");
+        ImGui::Separator();
         ImGui::MenuItem("Treemap panel", nullptr, &app.ShowMapPanel);
         ImGui::MenuItem("Treemap cushion shading", nullptr, &app.Treemap.Cushion);
         ImGui::Separator();
@@ -1231,11 +1254,11 @@ static void DrawUi(App& app) {
 
     if (app.Result && !app.Rescanning) {
         ImGui::SameLine();
-        ImGui::TextDisabled("| %llu files, %llu folders, %s  (scanned in %.2f s%s)",
+        ImGui::TextDisabled("| %llu files, %llu folders, %s%s  (scanned in %.2f s%s)",
                             app.Result->FileCount, app.Result->DirCount,
                             yadua::HumanSize(
-                                app.Result->Totals[yadua::kRootRecord].LogicalSize)
-                                .c_str(),
+                                app.Result->SizeOf(yadua::kRootRecord)).c_str(),
+                            app.Result->DisplayAllocated ? " on disk" : "",
                             app.Result->Stats.TotalSeconds,
                             app.Result->Stats.UsedFallback
                                 ? ", directory walk" : "");
@@ -1705,6 +1728,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
             app.Scanning = false;
             if (app.PendingError.empty()) {
                 app.Result = std::move(app.Pending);
+                app.Result->DisplayAllocated = app.ShowAllocated; // keep the toggle
                 app.UseSorted = false;
                 app.Treemap.Reset();
                 app.Status.clear();

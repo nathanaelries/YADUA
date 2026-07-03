@@ -44,12 +44,16 @@ Produces:
 ## GUI
 
 Launch `yadua-gui.exe` (it requests elevation itself), pick a drive, hit Scan.
+A standard menu bar (**File / Edit / View / Search / Tools / Help**) exposes
+every action; the toolbar keeps just the drive picker, Scan, and the filter
+box. Keyboard: `Ctrl+R` scan, `Ctrl+F` find, `Del` recycle the selection,
+`Esc` clear the filter.
 
 - **Tree tab** — sortable columns (click headers), percent-of-parent bars,
   filter box that auto-expands to matches. Filters combine name terms,
   extensions, and sizes: `setup *.iso >100mb`. A docked treemap panel sits
-  below the tree (resizable splitter, "Map panel" toggle); zoom and
-  selection stay in sync with the full-screen Treemap tab.
+  below the tree (resizable splitter, toggle in *View ▸ Treemap panel*); zoom
+  and selection stay in sync with the full-screen Treemap tab.
 - **Files tab** — a flat, sortable list of the largest files anywhere on the
   volume (WizTree-style), ignoring the folder hierarchy, with a per-file
   percent-of-volume bar and the containing folder. Honors the same filter
@@ -61,12 +65,16 @@ Launch `yadua-gui.exe` (it requests elevation itself), pick a drive, hit Scan.
 - **Treemap tab** — WinDirStat-style squarified treemap colored by file
   extension, with toggleable cushion shading. Hover for details,
   double-click to zoom into a folder, Up/Top to zoom out.
-- **Right-click** (both views) — Open in Explorer, Copy path, Properties,
+- **Size on disk** — *View ▸ Size on disk (allocated)* switches every view
+  (tree, files, types, treemap, totals) between logical file size and the
+  bytes actually reserved on disk. The choice is remembered.
+- **Right-click** (any view) — Open in Explorer, Copy path, Properties,
   Delete to Recycle Bin (with confirmation; the view updates in place,
   no rescan needed), and per-folder Rescan to refresh one subtree.
-- **Live updates** — after an MFT scan the toolbar tracks filesystem
-  changes via the NTFS USN journal ("live: N changes"); Apply folds them
-  in by re-reading only the affected MFT records, in well under a second.
+- **Live updates** — after an MFT scan the toolbar shows filesystem changes
+  seen via the NTFS USN journal ("N changes since scan"); *Tools ▸ Apply
+  filesystem changes* folds them in by re-reading only the affected MFT
+  records, in well under a second.
 
 ## Scan modes
 

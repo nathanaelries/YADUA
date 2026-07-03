@@ -102,12 +102,20 @@ struct ScanResult {
     uint64_t               FileCount = 0;
     uint64_t               DirCount  = 0;
 
+    // Display toggle: when true, SizeOf reports bytes-on-disk (allocated)
+    // instead of logical size, so the tree, treemap, and summaries all switch
+    // together (WizTree-style "size on disk"). Set by the GUI; the CLI leaves
+    // it false and reads the raw fields directly.
+    bool                   DisplayAllocated = false;
+
     bool Exists(uint32_t i) const {
         return (Nodes[i].Flags & kNodeInUse) && (Nodes[i].Flags & kNodeNamed);
     }
     bool IsDir(uint32_t i) const { return (Nodes[i].Flags & kNodeIsDir) != 0; }
     // A directory's display size is its cumulative subtree size.
     uint64_t SizeOf(uint32_t i) const {
+        if (DisplayAllocated)
+            return IsDir(i) ? Totals[i].AllocatedSize : Nodes[i].AllocatedSize;
         return IsDir(i) ? Totals[i].LogicalSize : Nodes[i].LogicalSize;
     }
     std::wstring Name(uint32_t i) const {
