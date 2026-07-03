@@ -76,6 +76,29 @@ falls back to a multi-threaded directory walk: slower (minutes instead of
 seconds on a big volume, and locked directories are skipped), but it works
 everywhere.
 
+## Updates
+
+The GUI can check for, verify, and install its own updates. It is
+**consent-gated** (nothing installs without you clicking Update) and
+**fails closed** — a bad signature, hash, or version means no update.
+
+On launch (opt-out in *About → Check for updates on launch*) YADUA fetches a
+small signed manifest from the GitHub **latest** release, verifies its ECDSA
+P-256 signature against a public key compiled into the binary, refuses anything
+that is not strictly newer (downgrade protection), then — once you click
+**Update now** — downloads the installer, checks its size and SHA-256 against
+the signed manifest, and runs it. The signature (not TLS, not `SHA256SUMS`) is
+the trust anchor: even a compromised download channel cannot get past it.
+
+Auto-update is **disabled until a signing key is embedded** (the shipped
+`src/update_pubkey.h` is an all-zero placeholder). See
+[docs/updates.md](docs/updates.md) for the full threat model, key custody, and
+the one-time setup (`tools/gen-signing-key.ps1`). The signing key fingerprint
+is shown in *About* so you can cross-check it here:
+
+> **Update signing key (SHA-256):**
+> `21020898359bc6b50db84b55e647a39432b64482b81b5c212f453f61f29a8a7b`
+
 ## CLI (run from an elevated prompt)
 
 ```powershell
@@ -119,6 +142,10 @@ number is not a pure scan time.
 - `src/cli.cpp` — console frontend + exports
 - `src/gui.cpp` — Dear ImGui frontend (tree view, deletion, sorting, filters)
 - `src/treemap.h/.cpp` — squarified treemap layout + rendering
+- `src/updater.h/.cpp` — signed auto-update (WinHTTP + BCrypt ECDSA/SHA-256);
+  `src/update_pubkey.h` holds the embedded public key
+- `tools/gen-signing-key.ps1`, `tools/sign-manifest.ps1` — offline keygen and
+  release-time manifest signing (see `docs/updates.md`)
 - `assets/` — logo/icon SVGs, generated PNG set, `yadua.ico` + `.rc` resource
 
 ## How it works

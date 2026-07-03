@@ -89,6 +89,13 @@
 - [x] VERSIONINFO resource stamped from the release tag
 - [ ] Code signing (Azure Trusted Signing or similar) to stop antivirus /
       SmartScreen false positives on the unsigned binaries
+- [x] Consent-gated auto-update: check the GitHub "latest" release, verify an
+      ECDSA P-256 signature over a manifest against a public key embedded in
+      the binary, enforce downgrade protection, then verify the installer's
+      SHA-256 before running it. Fails closed. CI signs the manifest with an
+      offline key; build-provenance attestation added. See docs/updates.md.
+      (Scaffolded: disabled until a real signing key is generated + embedded
+      via tools/gen-signing-key.ps1 and the YADUA_SIGNING_KEY secret is set.)
 - [x] Benchmark suite (`tools/benchmark.ps1`): times the raw-MFT scan, the
       directory-walk baseline (WinDirStat-style technique), and WizTree's
       CSV export when installed. Measured here: MFT 3.8 s vs walk 35 s

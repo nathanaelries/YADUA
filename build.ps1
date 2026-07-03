@@ -45,6 +45,7 @@ $cli = "cl $common /W4 `"$root\src\cli.cpp`" `"$root\src\scanner.cpp`"" +
 # The manifest requests Administrator elevation (raw volume access).
 $guiSrc = @(
     "$root\src\gui.cpp", "$root\src\treemap.cpp", "$root\src\scanner.cpp",
+    "$root\src\updater.cpp",
     "$imgui\imgui.cpp", "$imgui\imgui_draw.cpp",
     "$imgui\imgui_tables.cpp", "$imgui\imgui_widgets.cpp",
     "$imgui\backends\imgui_impl_win32.cpp", "$imgui\backends\imgui_impl_dx11.cpp"
@@ -57,7 +58,8 @@ $gui = "cl $common /W3 /DUNICODE /D_UNICODE /I`"$imgui`" /I`"$imgui\backends`" $
        " `"$obj\yadua-gui.res`" /Fe:`"$root\yadua-gui.exe`" /Fo:`"$obj`"\\" +
        " /link /SUBSYSTEM:WINDOWS" +
        " /MANIFEST:EMBED /MANIFESTUAC:level='requireAdministrator'" +
-       " d3d11.lib d3dcompiler.lib dxgi.lib user32.lib gdi32.lib shell32.lib ole32.lib"
+       " d3d11.lib d3dcompiler.lib dxgi.lib user32.lib gdi32.lib shell32.lib ole32.lib" +
+       " winhttp.lib bcrypt.lib version.lib"
 
 cmd /c "`"$vcvars`" $vcArch >nul 2>&1 && $res && $cli && $gui"
 if ($LASTEXITCODE -ne 0) { throw "Build failed." }

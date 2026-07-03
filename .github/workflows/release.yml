@@ -22,8 +22,15 @@ on:
     tags:
       - 'v*'          # v1.0.0, v2.3.1, v1.0.0-rc1, ...
 
+# NOTE (supply-chain): the third-party actions below are pinned to mutable
+# version tags (@v5, @v2, ...). For stronger hardening, pin each to a full
+# commit SHA (e.g. actions/checkout@<40-hex-sha>) so a compromised tag cannot
+# inject code into the build - the update signature only attests "this came
+# from our build", so a subverted build would sign malware faithfully.
 permissions:
-  contents: write     # needed by the release job to create the GitHub Release
+  contents: write     # release job creates the GitHub Release
+  id-token: write     # build job: OIDC token for build-provenance attestation
+  attestations: write # build job: record the provenance attestation
 
 env:
   # GitHub switches actions to Node 24 by default on 2026-06-16; opt in now
@@ -81,6 +88,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
           Get-ChildItem dist
 
+      # Signed build-provenance attestation (SLSA) for each installer/zip, so
+      # the artifacts can be traced to this workflow + commit independently of
+      # the update signature. Verifiable with `gh attestation verify <file>`.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -98,13 +113,31 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # Needed for tools/sign-manifest.ps1 (the release job otherwise only
+      # pulls artifacts, not the repo).
+      - name: Check out the tagged commit
+        uses: actions/checkout@v5
+
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true   # flatten binaries-amd64 + binaries-arm64
 
-      # Checksums let users verify their download; one file covering all assets.
+      # Build + sign the auto-update manifest (latest.yupd + latest.yupd.sig).
+      # Skipped automatically until the YADUA_SIGNING_KEY secret is configured,
+      # so releases keep working before the key exists. The private key lives
+      # only in this secret and only in this job's memory.
+      - name: Sign update manifest
+        shell: pwsh
+        env:
+          YADUA_SIGNING_KEY: ${{ secrets.YADUA_SIGNING_KEY }}
+        run: |
+          $ver = '${{ github.ref_name }}'.TrimStart('v')
+          ./tools/sign-manifest.ps1 -Version $ver -DistDir dist
+
+      # Checksums let users verify their download; one file covering all assets
+      # (including the signed manifest).
       - name: Generate SHA256SUMS.txt
         working-directory: dist
         run: sha256sum * | tee SHA256SUMS.txt

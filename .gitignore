@@ -18,3 +18,9 @@ results.json
 
 # Snapshots
 *.ysnap
+
+# Update-signing PRIVATE keys - must never be committed. Only the public key
+# (src/update_pubkey.h) belongs in the repo. See tools/gen-signing-key.ps1.
+.keys/
+*.pem
+yadua-signing-key*

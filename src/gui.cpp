@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cwctype>
 #include <memory>
 #include <string>
@@ -36,6 +37,7 @@
 #include "imgui_impl_win32.h"
 #include "scanner.h"
 #include "treemap.h"
+#include "updater.h"
 
 // ============================================================================
 // Application state
@@ -130,6 +132,27 @@ struct App {
     std::wstring      ApplyError;
     unsigned          ApplyUnresolved = 0;
     size_t            ApplyCount      = 0;
+
+    // ---- Auto-update (consent-gated) --------------------------------------
+    // A background thread checks the signed manifest on launch (if enabled)
+    // and reports; nothing downloads or installs until the user clicks Update.
+    bool                UpdCheckOnLaunch = true;  // persisted setting
+    std::wstring        UpdSkipVersion;           // "skip this version", persisted
+    bool                UpdCheckStarted  = false; // launch check fired once
+    bool                UpdChecking      = false;
+    bool                UpdCheckedThisRun = false; // show result after manual check
+    std::atomic<bool>   UpdCheckDone{false};
+    std::thread         UpdCheckThread;
+    yadua::UpdateInfo   UpdInfo;                  // written by the check thread
+    std::wstring        UpdCheckError;            // empty = ok
+    bool                ShowAbout        = false;
+
+    bool                UpdDownloading   = false;
+    std::atomic<bool>   UpdDownloadDone{false};
+    std::thread         UpdDownloadThread;
+    yadua::ScanProgress UpdProgress;
+    std::wstring        UpdInstallerPath;         // verified installer, when ready
+    std::wstring        UpdDownloadError;
 };
 
 // All fixed drives: NTFS gets the fast MFT scan, anything else (or a
@@ -450,6 +473,96 @@ static void FinishDelete(App& app) {
                  (unsigned)app.DeleteResult);
         app.Status = buf;
     }
+}
+
+// ============================================================================
+// Settings + auto-update (consent-gated)
+// ============================================================================
+
+// A tiny key=value file under %LOCALAPPDATA%\YADUA. Only two settings live
+// here today (the launch update-check opt-out and a skipped version), so the
+// format is deliberately trivial.
+static std::wstring SettingsPath() {
+    wchar_t base[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return std::wstring();
+    std::wstring dir = std::wstring(base) + L"\\YADUA";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir + L"\\settings.txt";
+}
+
+static void LoadSettings(App& app) {
+    std::wstring p = SettingsPath();
+    if (p.empty()) return;
+    FILE* f = _wfopen(p.c_str(), L"rb");
+    if (!f) return;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        std::string s(line);
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+        size_t eq = s.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = s.substr(0, eq), val = s.substr(eq + 1);
+        if (key == "checkOnLaunch") app.UpdCheckOnLaunch = (val != "0");
+        else if (key == "skip")     app.UpdSkipVersion = yadua::Wide(val);
+    }
+    fclose(f);
+}
+
+static void SaveSettings(App& app) {
+    std::wstring p = SettingsPath();
+    if (p.empty()) return;
+    FILE* f = _wfopen(p.c_str(), L"wb");
+    if (!f) return;
+    fprintf(f, "checkOnLaunch=%d\n", app.UpdCheckOnLaunch ? 1 : 0);
+    fprintf(f, "skip=%s\n", yadua::Utf8(app.UpdSkipVersion).c_str());
+    fclose(f);
+}
+
+static void StartUpdateCheck(App& app, bool manual) {
+    if (app.UpdChecking || app.UpdDownloading || !yadua::UpdaterConfigured())
+        return;
+    if (app.UpdCheckThread.joinable()) app.UpdCheckThread.join();
+    app.UpdChecking = true;
+    app.UpdCheckDone = false;
+    app.UpdCheckError.clear();
+    if (manual) app.UpdCheckedThisRun = true;
+    std::wstring cur = yadua::RunningVersion();
+    app.UpdCheckThread = std::thread([&app, cur] {
+        yadua::UpdateInfo info;
+        std::wstring err;
+        if (!yadua::CheckForUpdate(cur, info, err)) app.UpdCheckError = err;
+        else app.UpdInfo = info;
+        app.UpdCheckDone = true; // release: UpdInfo/UpdCheckError written before
+    });
+}
+
+static void StartUpdateDownload(App& app) {
+    if (app.UpdDownloading || app.UpdChecking || !app.UpdInfo.Available) return;
+    if (app.UpdDownloadThread.joinable()) app.UpdDownloadThread.join();
+    app.UpdDownloading = true;
+    app.UpdDownloadDone = false;
+    app.UpdDownloadError.clear();
+    app.UpdInstallerPath.clear();
+    app.UpdProgress.BytesRead  = 0;
+    app.UpdProgress.TotalBytes = 0;
+    yadua::UpdateInfo info = app.UpdInfo;
+    app.UpdDownloadThread = std::thread([&app, info] {
+        std::wstring path, err;
+        if (!yadua::DownloadUpdate(info, path, err, &app.UpdProgress))
+            app.UpdDownloadError = err;
+        else app.UpdInstallerPath = path;
+        app.UpdDownloadDone = true;
+    });
+}
+
+// True when there is a verified, strictly-newer release the user hasn't
+// chosen to skip. Gated on !UpdChecking so we never read UpdInfo while the
+// check thread is mid-write (the main loop clears UpdChecking only after the
+// join, which synchronizes that write).
+static bool UpdateBannerVisible(const App& app) {
+    return yadua::UpdaterConfigured() && !app.UpdChecking &&
+           app.UpdInfo.Available && app.UpdInfo.Version != app.UpdSkipVersion;
 }
 
 // ============================================================================
@@ -1009,7 +1122,44 @@ static void DrawUi(App& app) {
         ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1.0f), "| %s",
                            app.Status.c_str());
     }
+
+    // About / update affordance, right-aligned on the toolbar row.
+    {
+        bool upd = UpdateBannerVisible(app);
+        const char* lbl = upd ? "Update ready" : "About";
+        float bw = ImGui::CalcTextSize(lbl).x +
+                   ImGui::GetStyle().FramePadding.x * 2.0f;
+        float rx = ImGui::GetWindowContentRegionMax().x - bw;
+        ImGui::SameLine();
+        if (rx > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(rx);
+        if (upd)
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.45f, 0.22f, 1));
+        if (ImGui::SmallButton(lbl)) app.ShowAbout = true;
+        if (upd) ImGui::PopStyleColor();
+    }
     ImGui::Separator();
+
+    // ---- Update banner ------------------------------------------------------
+    if (UpdateBannerVisible(app) && !app.UpdDownloading) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f, 0.85f, 0.60f, 1.0f));
+        ImGui::Text("Update available: YADUA %s",
+                    yadua::Utf8(app.UpdInfo.Version).c_str());
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Update now")) StartUpdateDownload(app);
+        if (!app.UpdInfo.NotesUrl.empty()) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Release notes"))
+                ShellExecuteW(nullptr, L"open", app.UpdInfo.NotesUrl.c_str(),
+                              nullptr, nullptr, SW_SHOWNORMAL);
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Skip this version")) {
+            app.UpdSkipVersion = app.UpdInfo.Version;
+            SaveSettings(app);
+        }
+        ImGui::Separator();
+    }
 
     // ---- Body ---------------------------------------------------------------
     if (app.Applying) {
@@ -1140,6 +1290,82 @@ static void DrawUi(App& app) {
         ImGui::EndPopup();
     }
 
+    // ---- About / updates ----------------------------------------------------
+    if (app.ShowAbout && !ImGui::IsPopupOpen("About YADUA"))
+        ImGui::OpenPopup("About YADUA");
+    if (ImGui::BeginPopupModal("About YADUA", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted("YADUA - Yet Another Disk Usage Analyzer");
+        ImGui::Text("Version %s", yadua::Utf8(yadua::RunningVersion()).c_str());
+        ImGui::Separator();
+        if (yadua::UpdaterConfigured()) {
+            ImGui::TextDisabled("Update signing key (SHA-256):");
+            ImGui::TextWrapped("%s", yadua::UpdatePublicKeyFingerprint());
+            ImGui::Spacing();
+            if (ImGui::Checkbox("Check for updates on launch",
+                                &app.UpdCheckOnLaunch))
+                SaveSettings(app);
+            ImGui::BeginDisabled(app.UpdChecking || app.UpdDownloading);
+            if (ImGui::Button("Check now")) StartUpdateCheck(app, true);
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (app.UpdChecking) {
+                ImGui::TextDisabled("checking...");
+            } else if (!app.UpdCheckError.empty()) {
+                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f), "check failed");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s",
+                                      yadua::Utf8(app.UpdCheckError).c_str());
+            } else if (app.UpdInfo.Available) {
+                ImGui::TextColored(ImVec4(0.6f, 0.85f, 0.6f, 1.0f),
+                                   "v%s available",
+                                   yadua::Utf8(app.UpdInfo.Version).c_str());
+            } else if (app.UpdCheckedThisRun) {
+                ImGui::TextDisabled("up to date");
+            }
+            if (UpdateBannerVisible(app)) {
+                ImGui::Spacing();
+                if (ImGui::Button("Download & install update"))
+                    StartUpdateDownload(app);
+            }
+        } else {
+            ImGui::TextDisabled("Auto-update is not configured in this build");
+            ImGui::TextDisabled("(no signing key embedded).");
+        }
+        ImGui::Separator();
+        if (ImGui::Button("Close")) {
+            app.ShowAbout = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    if (app.UpdDownloading && !ImGui::IsPopupOpen("Updating"))
+        ImGui::OpenPopup("Updating");
+    if (ImGui::BeginPopupModal("Updating", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Downloading update %s ...",
+                    yadua::Utf8(app.UpdInfo.Version).c_str());
+        uint64_t rd = app.UpdProgress.BytesRead.load(std::memory_order_relaxed);
+        uint64_t tt = app.UpdProgress.TotalBytes.load(std::memory_order_relaxed);
+        char overlay[64];
+        float frac;
+        if (tt) {
+            frac = (float)((double)rd / (double)tt);
+            snprintf(overlay, sizeof(overlay), "%s / %s",
+                     yadua::HumanSize(rd).c_str(), yadua::HumanSize(tt).c_str());
+        } else {
+            frac = -1.0f * (float)ImGui::GetTime();
+            snprintf(overlay, sizeof(overlay), "%s", yadua::HumanSize(rd).c_str());
+        }
+        ImGui::ProgressBar(frac, ImVec2(ImGui::GetFontSize() * 25.0f, 0.0f),
+                           overlay);
+        ImGui::TextDisabled("The verified installer will launch and YADUA will "
+                            "close to finish updating.");
+        if (!app.UpdDownloading) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
     ImGui::End();
 }
 
@@ -1259,6 +1485,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
 
     App app;
     ListFixedDrives(app);
+    LoadSettings(app);
     app.AutoScan    = cmdLine && wcsstr(cmdLine, L"--autoscan") != nullptr;
     app.OpenTreemap = cmdLine && wcsstr(cmdLine, L"--view treemap") != nullptr;
 
@@ -1281,6 +1508,33 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
         }
 
         if (app.AutoScan) { app.AutoScan = false; StartScan(app); }
+
+        // One-shot update check on launch (opt-out, and never for unstamped
+        // local builds whose version reads 0.0.0).
+        if (!app.UpdCheckStarted) {
+            app.UpdCheckStarted = true;
+            if (app.UpdCheckOnLaunch && yadua::UpdaterConfigured() &&
+                yadua::RunningVersion() != L"0.0.0")
+                StartUpdateCheck(app, false);
+        }
+        if (app.UpdChecking && app.UpdCheckDone) {
+            app.UpdCheckThread.join();
+            app.UpdChecking = false; // UI reads UpdInfo / UpdCheckError
+        }
+        if (app.UpdDownloading && app.UpdDownloadDone) {
+            app.UpdDownloadThread.join();
+            app.UpdDownloading = false;
+            if (app.UpdDownloadError.empty() && !app.UpdInstallerPath.empty()) {
+                std::wstring err;
+                if (yadua::LaunchInstaller(app.UpdInstallerPath, err))
+                    done = true; // quit so the installer can replace files
+                else
+                    app.Status = "Update launch failed: " + yadua::Utf8(err);
+            } else {
+                app.Status = "Update failed: " + yadua::Utf8(app.UpdDownloadError);
+            }
+        }
+
         if (app.Applying && app.ApplyDone) {
             app.ApplyThread.join();
             app.Applying = false;
@@ -1334,6 +1588,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
             }
         }
 
+        if (done) break; // e.g. update installer just launched
+
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
@@ -1352,6 +1608,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
     if (app.DeleteThread.joinable()) app.DeleteThread.join();
     if (app.RescanThread.joinable()) app.RescanThread.join();
     if (app.ApplyThread.joinable()) app.ApplyThread.join();
+    if (app.UpdCheckThread.joinable()) app.UpdCheckThread.join();
+    if (app.UpdDownloadThread.joinable()) app.UpdDownloadThread.join();
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
