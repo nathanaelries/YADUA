@@ -146,9 +146,11 @@
 - [x] **Remember window size/position and the last-scanned drive** across runs
       (persisted in the settings file)
 - [ ] **Multi-select** in the tree and Files list for bulk delete / export
-- [~] **Free / unused space**: used / free / total shown in the toolbar after
-      a scan (GetDiskFreeSpaceEx). The treemap free-space *slice* is deferred -
-      it's a visual layout change that wants eyes-on verification.
+- [x] **Free / unused space**: used/free/total in the toolbar, and the treemap
+      now represents the whole disk - a "free" block and an "unaccounted" block
+      alongside the scanned tree (SpaceSniffer/WizTree-style), proportional to
+      bytes. Only at the volume root of a full volume scan. Layout verified
+      headlessly (blocks in-bounds; free area == free/total).
 - [x] **File attributes** column: Win32 FILE_ATTRIBUTE_* captured from
       `$STANDARD_INFORMATION` (offset 0x20) and the walk fallback, shown as
       R/H/S/A/C/E letters in the Tree and Files views (hidden by default) and

@@ -93,8 +93,8 @@ void TreemapView::LayoutChildren(const ScanResult& r, uint32_t dir,
         for (uint32_t c = from; c < end; ++c)
             if (r.Exists(r.Children.List[c])) ++count;
         if (count && rx1 - rx0 >= 1.0f && ry1 - ry0 >= 1.0f)
-            items_.push_back({{rx0, ry0}, {rx1, ry1}, dir, count,
-                              (uint8_t)depth, false});
+            items_.push_back({{rx0, ry0}, {rx1, ry1}, dir, count, 0,
+                              (uint8_t)depth, NotSpecial, false});
     };
 
     uint32_t c = begin;
@@ -152,8 +152,8 @@ void TreemapView::LayoutChildren(const ScanResult& r, uint32_t dir,
             along += extent;
             if (cx1 - cx0 < 0.5f || cy1 - cy0 < 0.5f) continue; // sub-pixel
             bool isDir = r.IsDir(child);
-            items_.push_back({{cx0, cy0}, {cx1, cy1}, child, 0,
-                              (uint8_t)depth, isDir});
+            items_.push_back({{cx0, cy0}, {cx1, cy1}, child, 0, 0,
+                              (uint8_t)depth, NotSpecial, isDir});
             if (isDir && cx1 - cx0 >= 2 * kMinSide && cy1 - cy0 >= 2 * kMinSide)
                 LayoutChildren(r, child, cx0 + 1, cy0 + 1, cx1 - 1, cy1 - 1,
                                depth + 1);
@@ -171,10 +171,46 @@ void TreemapView::Build(const ScanResult& r, ImVec2 origin, ImVec2 size) {
     items_.reserve(65536);
     if (root_ >= r.Nodes.size() || !r.Exists(root_) || !r.IsDir(root_))
         root_ = (uint32_t)yadua::kRootRecord;
-    items_.push_back({origin, {origin.x + size.x, origin.y + size.y},
-                      root_, 0, 0, true});
-    LayoutChildren(r, root_, origin.x + 1, origin.y + 1,
-                   origin.x + size.x - 1, origin.y + size.y - 1, 1);
+
+    // The tree fills the whole canvas, unless we're showing the whole disk (at
+    // the volume root, with capacity known): then split the canvas into
+    // [ scanned tree | unaccounted | free ] proportional to bytes, and lay the
+    // tree into just the "scanned" band.
+    ImVec2 treeOrigin = origin, treeSize = size;
+    bool wholeDisk = root_ == (uint32_t)yadua::kRootRecord && total_ > 0;
+    if (wholeDisk) {
+        double used  = (double)r.SizeOf(root_);
+        double freeB = (double)free_;
+        double other = (double)total_ - freeB - used;
+        if (other < 0) other = 0;
+        double denom = used + freeB + other;
+        if (denom <= 0) denom = 1;
+
+        bool  horiz  = size.x >= size.y;
+        float extent = horiz ? size.x : size.y;
+        float usedExt = (float)(extent * used / denom);
+        treeSize = horiz ? ImVec2(usedExt, size.y) : ImVec2(size.x, usedExt);
+
+        float pos = horiz ? origin.x + usedExt : origin.y + usedExt;
+        auto addBlock = [&](double bytes, uint8_t kind) {
+            float ext = (float)(extent * bytes / denom);
+            if (ext < 1.0f) return;
+            ImVec2 mn = horiz ? ImVec2(pos, origin.y) : ImVec2(origin.x, pos);
+            ImVec2 mx = horiz ? ImVec2(pos + ext, origin.y + size.y)
+                              : ImVec2(origin.x + size.x, pos + ext);
+            items_.push_back({mn, mx, 0, 0, (uint64_t)bytes, 0, kind, false});
+            pos += ext;
+        };
+        addBlock(other, Unaccounted);
+        addBlock(freeB, FreeSpace);
+    }
+
+    items_.push_back({treeOrigin,
+                      {treeOrigin.x + treeSize.x, treeOrigin.y + treeSize.y},
+                      root_, 0, 0, 0, NotSpecial, true});
+    LayoutChildren(r, root_, treeOrigin.x + 1, treeOrigin.y + 1,
+                   treeOrigin.x + treeSize.x - 1, treeOrigin.y + treeSize.y - 1,
+                   1);
     builtPos_  = origin;
     builtSize_ = size;
     dirty_     = false;
@@ -226,7 +262,19 @@ void TreemapView::Draw(const ScanResult& r,
     ImDrawList* dl = ImGui::GetWindowDrawList();
     dl->PushClipRect(origin, {origin.x + size.x, origin.y + size.y}, true);
     for (const Item& it : items_) {
-        if (it.RestCount) {
+        if (it.Kind != NotSpecial) {
+            // Whole-disk blocks: free space (green) and unaccounted (neutral).
+            ImU32 fill = it.Kind == FreeSpace ? IM_COL32(46, 78, 58, 255)
+                                              : IM_COL32(56, 52, 46, 255);
+            dl->AddRectFilled(it.Min, it.Max, fill);
+            dl->AddRect(it.Min, it.Max, kFileBorder);
+            const char* lbl = it.Kind == FreeSpace ? "free" : "other";
+            ImVec2 ts = ImGui::CalcTextSize(lbl);
+            if (it.Max.x - it.Min.x > ts.x + 6 && it.Max.y - it.Min.y > ts.y + 6)
+                dl->AddText({(it.Min.x + it.Max.x) * 0.5f - ts.x * 0.5f,
+                             (it.Min.y + it.Max.y) * 0.5f - ts.y * 0.5f},
+                            IM_COL32(210, 220, 214, 220), lbl);
+        } else if (it.RestCount) {
             dl->AddRectFilled(it.Min, it.Max, RestColor(it.Node));
             if (it.Max.x - it.Min.x > 4 && it.Max.y - it.Min.y > 4)
                 dl->AddRect(it.Min, it.Max, kFileBorder);
@@ -259,7 +307,17 @@ void TreemapView::Draw(const ScanResult& r,
     dl->PopClipRect();
 
     // ---- Interaction --------------------------------------------------------
-    if (hover >= 0) {
+    if (hover >= 0 && items_[hover].Kind != NotSpecial) {
+        // Free / unaccounted block: informational tooltip only (no node).
+        const Item& it = items_[hover];
+        if (ImGui::BeginTooltip()) {
+            ImGui::TextUnformatted(it.Kind == FreeSpace
+                ? "Free space"
+                : "Unaccounted (system/overhead not in the scan)");
+            ImGui::TextDisabled("%s", yadua::HumanSize(it.Bytes).c_str());
+            ImGui::EndTooltip();
+        }
+    } else if (hover >= 0) {
         const Item& it = items_[hover];
         if (ImGui::BeginTooltip()) {
             if (it.RestCount) {

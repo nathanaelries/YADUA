@@ -2226,6 +2226,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
                 } else {
                     app.VolTotalBytes = app.VolFreeBytes = 0;
                 }
+                // Whole-disk treemap (free/unaccounted blocks) only for a full
+                // volume scan - a folder scan's "free space" would be the whole
+                // disk, which is misleading, so disable it there.
+                bool volumeScan = app.Result->Drive.size() <= 3;
+                app.Treemap.SetVolumeInfo(volumeScan ? app.VolTotalBytes : 0,
+                                          volumeScan ? app.VolFreeBytes : 0);
                 app.UseSorted = false;
                 app.Treemap.Reset();
                 app.Status.clear();
