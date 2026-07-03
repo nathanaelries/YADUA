@@ -74,10 +74,11 @@
 
 - [x] Auto-elevation (GUI manifest requests Administrator; non-elevated
       scans still work via the directory-walk fallback)
-- [x] Live updates via USN journal: after an MFT scan the GUI watches the
-      change journal, shows a "live: N changes" counter, and Apply folds
-      the changes in by re-reading just the affected MFT records (no
-      rescan). Journal wrap/loss is detected and surfaced.
+- [~] Live updates via USN journal: implemented (GUI watched the change
+      journal and folded changes in via `ApplyMftUpdates`), then **removed
+      from the GUI** because the background monitor was implicated in hangs
+      /crashes. The `UsnMonitor` / `ApplyMftUpdates` library code remains for
+      the CLI `debug-usn` command; the GUI now refreshes via Rescan instead.
 - [x] Export/import scan snapshots; diff two scans over time
       (`--snapshot out.ysnap`, `--diff old.ysnap new.ysnap` or
       `--diff old.ysnap C:` to compare against a live scan; compact
@@ -104,6 +105,19 @@
       keyboard shortcuts (Ctrl+R, Ctrl+F, Del, Esc); the toolbar keeps only
       the drive picker, Scan, and filter. Retired the cryptic "Apply" and
       "About" toolbar buttons.
+- [x] Stability & responsiveness pass (audit-driven):
+      - removed the USN live-monitor from the GUI (background thread that
+        mutated the tree in place — the likely hang/crash source)
+      - debounced the filter box (was an O(all-nodes) recompute per keystroke,
+        which made typing lag) and made the match loop allocation-free
+      - hardened MFT parsing: reject corrupt run-list nibbles (was a stack
+        buffer overflow), bound every attribute length to the record (OOB
+        reads), overflow-safe value bounds
+      - bounded ApplyMftUpdates (RAII volume handle + cap on record growth) and
+        LoadSnapshot (node count vs. file size) against giant allocations
+      - added WinHTTP timeouts so a stalled update can't block shutdown
+      - fixed a rescan-vs-UI data race (menu/shortcuts read the tree while a
+        worker mutated it) and a null render-target deref on resize
 
 ## Phase 4 — WizTree / WinDirStat competitive parity
 

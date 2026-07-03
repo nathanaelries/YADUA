@@ -183,6 +183,11 @@ bool HttpFetch(const std::wstring& url, std::string* body, HANDLE file,
                           WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0)};
     if (!ses) { err = L"WinHttpOpen failed"; return false; }
 
+    // Bounded timeouts (resolve, connect, send, receive), in ms. Without these
+    // a stalled server can block the worker thread - and app shutdown, which
+    // joins it - well beyond the OS defaults. Fail fast instead.
+    WinHttpSetTimeouts(ses, 10000, 15000, 15000, 30000);
+
     // Require modern TLS.
     DWORD secure = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
 #ifdef WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3

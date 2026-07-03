@@ -174,7 +174,12 @@ std::vector<Extent> DecodeRunList(const uint8_t* p, const uint8_t* end,
         int lenBytes = *p & 0x0F;
         int offBytes = (*p >> 4) & 0x0F;
         ++p;
-        if (lenBytes == 0 || p + lenBytes + offBytes > end) break;
+        // The nibbles are 0-15 on disk but index fixed 8-byte destinations; a
+        // corrupt header byte (nibble > 8) would overflow the memcpy locals
+        // below. Reject it instead of smashing the stack.
+        if (lenBytes == 0 || lenBytes > 8 || offBytes > 8 ||
+            p + lenBytes + offBytes > end)
+            break;
 
         uint64_t length = 0;
         memcpy(&length, p, lenBytes);
@@ -185,8 +190,9 @@ std::vector<Extent> DecodeRunList(const uint8_t* p, const uint8_t* end,
         } else {
             int64_t delta = 0;
             memcpy(&delta, p, offBytes);
-            // sign-extend the variable-width delta
-            if (p[offBytes - 1] & 0x80)
+            // sign-extend the variable-width delta (offBytes==8 already fills
+            // the whole int64; shifting by 64 would be UB, so skip it)
+            if (offBytes < 8 && (p[offBytes - 1] & 0x80))
                 delta |= ~0LL << (offBytes * 8);
             p += offBytes;
             lcn += delta;
@@ -685,13 +691,18 @@ bool ExtendRunsFromAttributeList(HANDLE volume, const uint8_t* rec0,
     while (offset + sizeof(AttributeHeader) <= limit) {
         auto* attr = reinterpret_cast<const AttributeHeader*>(rec0 + offset);
         if (attr->Type == kAttrEnd || attr->Length == 0) break;
+        if (attr->Length < sizeof(AttributeHeader) ||
+            offset + attr->Length > limit)
+            break; // keep the attribute value / run list inside the record
         if (attr->Type == kAttrAttributeList) {
             if (!attr->NonResident) {
                 auto* res = reinterpret_cast<const ResidentAttribute*>(attr);
-                if (res->ValueOffset + res->ValueLength <= attr->Length)
+                // Overflow-safe form of ValueOffset + ValueLength <= Length.
+                if (res->ValueLength <= attr->Length &&
+                    res->ValueOffset <= attr->Length - res->ValueLength)
                     list.assign(rec0 + offset + res->ValueOffset,
                                 rec0 + offset + res->ValueOffset + res->ValueLength);
-            } else {
+            } else if (offset + sizeof(NonResidentAttribute) <= limit) {
                 // The list itself is non-resident: read its clusters.
                 auto* nr = reinterpret_cast<const NonResidentAttribute*>(attr);
                 auto listRuns = DecodeRunList(rec0 + offset + nr->RunListOffset,
@@ -752,8 +763,12 @@ bool ExtendRunsFromAttributeList(HANDLE volume, const uint8_t* rec0,
         while (eoffset + sizeof(AttributeHeader) <= elimit) {
             auto* attr = reinterpret_cast<AttributeHeader*>(rec.data() + eoffset);
             if (attr->Type == kAttrEnd || attr->Length == 0) break;
+            if (attr->Length < sizeof(AttributeHeader) ||
+                eoffset + attr->Length > elimit)
+                break; // keep attribute + run-list end inside the record
             if (attr->Type == kAttrData && attr->NameLength == 0 &&
-                attr->NonResident) {
+                attr->NonResident &&
+                eoffset + sizeof(NonResidentAttribute) <= elimit) {
                 auto* nr = reinterpret_cast<NonResidentAttribute*>(attr);
                 auto more = DecodeRunList(rec.data() + eoffset + nr->RunListOffset,
                                           rec.data() + eoffset + attr->Length,
@@ -970,7 +985,14 @@ bool ScanVolume(const std::wstring& driveIn, unsigned threads, ScanResult& out,
         while (offset + sizeof(AttributeHeader) <= limit) {
             auto* attr = reinterpret_cast<AttributeHeader*>(rec0.data() + offset);
             if (attr->Type == kAttrEnd || attr->Length == 0) break;
-            if (attr->Type == kAttrData && attr->NameLength == 0 && attr->NonResident) {
+            // Trust nothing from disk: keep the whole attribute (and hence the
+            // run-list end pointer below) inside the record buffer.
+            if (attr->Length < sizeof(AttributeHeader) ||
+                offset + attr->Length > limit)
+                break;
+            if (attr->Type == kAttrData && attr->NameLength == 0 &&
+                attr->NonResident &&
+                offset + sizeof(NonResidentAttribute) <= limit) {
                 auto* nr = reinterpret_cast<NonResidentAttribute*>(attr);
                 const uint8_t* rl  = rec0.data() + offset + nr->RunListOffset;
                 const uint8_t* end = rec0.data() + offset + attr->Length;
@@ -1316,8 +1338,19 @@ bool LoadSnapshot(const std::wstring& file, ScanResult& out,
     if (fread(out.Drive.data(), sizeof(wchar_t), driveChars, f) != driveChars)
         return fail(L"truncated");
     uint64_t count = 0;
-    if (fread(&count, 8, 1, f) != 1 || count == 0 || count > 0xFFFFFFFFull)
-        return fail(L"bad node count");
+    if (fread(&count, 8, 1, f) != 1) return fail(L"bad node count");
+    // Bound count by what the file can physically hold (each node is at least
+    // the fixed struct, plus its name), so a corrupt/hostile count can't
+    // trigger a giant up-front allocation before the per-node reads catch it.
+    __int64 here = _ftelli64(f);
+    _fseeki64(f, 0, SEEK_END);
+    __int64 fileEnd = _ftelli64(f);
+    _fseeki64(f, here, SEEK_SET);
+    size_t minNode = version >= 2 ? sizeof(SnapNode) : sizeof(SnapNodeV1);
+    uint64_t maxNodes = (here >= 0 && fileEnd >= here)
+                            ? (uint64_t)(fileEnd - here) / minNode
+                            : 0;
+    if (count == 0 || count > maxNodes) return fail(L"bad node count");
 
     // Dense index d maps to node index kRootRecord (d == 0) or kRootRecord + d.
     auto toIndex = [](uint32_t d) {
@@ -1479,6 +1512,15 @@ bool ApplyMftUpdates(ScanResult& r, const std::vector<uint64_t>& fileRefs,
                        GetLastError());
         return false;
     }
+    // Close on every return path (including an exception unwinding the stack).
+    struct HandleCloser {
+        HANDLE h;
+        ~HandleCloser() { CloseHandle(h); }
+    } closer{volume};
+
+    // The MFT can hold at most this many records; anything beyond is a stale/
+    // bogus reference that must not drive a giant Nodes.resize below.
+    const uint64_t maxRecords = r.Stats.MftBytes / r.Stats.RecordSize;
 
     ParseContext ctx;
     ctx.Nodes = &r.Nodes;
@@ -1487,13 +1529,14 @@ bool ApplyMftUpdates(ScanResult& r, const std::vector<uint64_t>& fileRefs,
 
     for (uint64_t ref : fileRefs) {
         uint64_t recno = ref & 0x0000FFFFFFFFFFFFull;
-        if (recno >= 0xFFFFFFFFull) continue;
-        // New files may land in records past the original scan; make room.
-        if (recno >= r.Nodes.size()) {
-            // Past the mapped MFT extents: ReadMftRecord below will fail and
-            // count as unresolved, but in-range growth is fine.
-            r.Nodes.resize(recno + 1);
+        // New files may land in records past the original scan (up to the MFT
+        // capacity); anything past that is unreadable -> unresolved.
+        if (recno >= maxRecords) {
+            if (unresolved) ++*unresolved;
+            continue;
         }
+        if (recno >= r.Nodes.size())
+            r.Nodes.resize((size_t)recno + 1);
         r.Nodes[(size_t)recno] = Node{}; // deleted unless re-read succeeds
 
         std::vector<uint8_t> rec;
@@ -1509,7 +1552,7 @@ bool ApplyMftUpdates(ScanResult& r, const std::vector<uint64_t>& fileRefs,
         if (r.Nodes[(size_t)recno].Flags & kNodeNamed)
             updated.push_back((uint32_t)recno);
     }
-    CloseHandle(volume);
+    // volume closed by `closer` (RAII).
 
     // Names were appended to the context arena; merge and rebase.
     uint32_t base = (uint32_t)r.NameArena.size();

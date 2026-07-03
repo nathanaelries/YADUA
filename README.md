@@ -73,10 +73,11 @@ box. Keyboard: `Ctrl+R` scan, `Ctrl+F` find, `Del` recycle the selection,
 - **Right-click** (any view) — Open in Explorer, Copy path, Properties,
   Delete to Recycle Bin (with confirmation; the view updates in place,
   no rescan needed), and per-folder Rescan to refresh one subtree.
-- **Live updates** — after an MFT scan the toolbar shows filesystem changes
-  seen via the NTFS USN journal ("N changes since scan"); *Tools ▸ Apply
-  filesystem changes* folds them in by re-reading only the affected MFT
-  records, in well under a second.
+
+The filter box is debounced: it applies shortly after you stop typing (or on
+Enter), so typing stays responsive even on multi-million-file volumes. Rescan
+(or *Tools ▸ Rescan selected folder*) to pick up filesystem changes since the
+scan.
 
 ## Scan modes
 

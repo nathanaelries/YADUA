@@ -84,6 +84,11 @@ struct App {
     // descendant. Empty vector means "no filter, everything visible".
     char                 Filter[256] = {};
     std::vector<uint8_t> Visible;
+    // Debounce: recomputing the filter is O(all nodes), so we don't do it on
+    // every keystroke. An edit stamps FilterEditedAt and sets FilterPending;
+    // DrawUi recomputes once typing has been idle briefly (or on Enter).
+    bool                 FilterPending  = false;
+    double               FilterEditedAt = 0.0;
 
     // Cross-view navigation: selection is shared, and either view can ask the
     // other to show a node (treemap "Reveal in tree" / tree "Show in treemap").
@@ -142,17 +147,6 @@ struct App {
     std::wstring        RescanError; // written by the worker before RescanDone
     yadua::ScanProgress RescanProgress;
 
-    // USN live updates: the monitor counts filesystem changes since the scan;
-    // Apply folds them in by re-reading just the affected MFT records (same
-    // UI gating as a rescan while Result mutates).
-    yadua::UsnMonitor Monitor;
-    bool              Applying = false;
-    std::atomic<bool> ApplyDone{false};
-    std::thread       ApplyThread;
-    std::wstring      ApplyError;
-    unsigned          ApplyUnresolved = 0;
-    size_t            ApplyCount      = 0;
-
     // ---- Auto-update (consent-gated) --------------------------------------
     // A background thread checks the signed manifest on launch (if enabled)
     // and reports; nothing downloads or installs until the user clicks Update.
@@ -189,10 +183,8 @@ static void ListFixedDrives(App& app) {
 }
 
 static void StartScan(App& app) {
-    if (app.Scanning || app.Deleting || app.Rescanning || app.Applying ||
-        app.Drives.empty())
+    if (app.Scanning || app.Deleting || app.Rescanning || app.Drives.empty())
         return;
-    app.Monitor.Stop(); // a fresh scan resets the change-tracking baseline
     if (app.ScanThread.joinable()) app.ScanThread.join();
     app.Pending = std::make_unique<yadua::ScanResult>();
     app.Progress.BytesRead  = 0;
@@ -285,10 +277,12 @@ static void RecomputeFilter(App& app) {
     if (terms.empty()) { app.Visible.clear(); return; }
 
     app.Visible.assign(r->Nodes.size(), 0);
-    std::wstring name;
+    std::wstring name;              // reused across nodes: assign() keeps its
+    name.reserve(300);             // buffer, so the loop does no per-node alloc
     for (uint32_t i = 0; i < r->Nodes.size(); ++i) {
         if (!r->Exists(i)) continue;
-        name = r->Name(i);
+        const yadua::Node& nd = r->Nodes[i];
+        name.assign(r->NameArena.data() + nd.NameOffset, nd.NameLength);
         for (wchar_t& c : name) c = towlower(c);
 
         bool match = true;
@@ -371,28 +365,8 @@ static void ApplySort(App& app, const ImGuiTableColumnSortSpecs& spec) {
 // Deletion (Recycle Bin)
 // ============================================================================
 
-static void StartApply(App& app) {
-    if (app.Applying || app.Scanning || app.Deleting || app.Rescanning ||
-        !app.Result)
-        return;
-    if (app.ApplyThread.joinable()) app.ApplyThread.join();
-    app.ApplyError.clear();
-    app.ApplyDone = false;
-    app.Applying  = true;
-    app.ApplyThread = std::thread([&app] {
-        std::vector<uint64_t> dirty = app.Monitor.TakeDirty();
-        app.ApplyCount = dirty.size();
-        std::wstring err;
-        if (!yadua::ApplyMftUpdates(*app.Result, dirty, err,
-                                    &app.ApplyUnresolved))
-            app.ApplyError = err;
-        app.ApplyDone = true;
-    });
-}
-
 static void StartRescan(App& app, uint32_t node) {
-    if (app.Rescanning || app.Scanning || app.Deleting || app.Applying ||
-        !app.Result)
+    if (app.Rescanning || app.Scanning || app.Deleting || !app.Result)
         return;
     if (app.RescanThread.joinable()) app.RescanThread.join();
     app.RescanPath  = app.Result->Path(node);
@@ -408,8 +382,7 @@ static void StartRescan(App& app, uint32_t node) {
 }
 
 static void StartDelete(App& app, uint32_t node) {
-    if (app.Deleting || app.Scanning || app.Rescanning || app.Applying ||
-        !app.Result)
+    if (app.Deleting || app.Scanning || app.Rescanning || !app.Result)
         return;
     if (app.DeleteThread.joinable()) app.DeleteThread.join();
     app.DeleteNode   = node;
@@ -675,7 +648,7 @@ static void DrawTree(App& app, const yadua::ScanResult& r, uint32_t idx,
     if (idx == app.SelectedNode) flags |= ImGuiTreeNodeFlags_Selected;
     if (isRoot) ImGui::SetNextItemOpen(true, ImGuiCond_Once);
     else if (filtered && isDir) ImGui::SetNextItemOpen(true); // expand to matches
-    if (!app.RevealOpen.empty() && isDir && app.RevealOpen[idx])
+    if (idx < app.RevealOpen.size() && isDir && app.RevealOpen[idx])
         ImGui::SetNextItemOpen(true);                         // expand to reveal
 
     std::string label = isRoot ? yadua::Utf8(r.Drive) : yadua::Utf8(r.Name(idx));
@@ -721,7 +694,7 @@ static void DrawTree(App& app, const yadua::ScanResult& r, uint32_t idx,
         for (uint32_t c = childBegin; c < childEnd; ++c) {
             uint32_t child = list[c];
             bool revealing = child == app.RevealNode ||
-                             (!app.RevealOpen.empty() && app.RevealOpen[child]);
+                             (child < app.RevealOpen.size() && app.RevealOpen[child]);
             if (!r.Exists(child)) continue;            // recycled this session
             if (filtered && !app.Visible[child] && !revealing) continue;
             if (shown >= kMaxChildrenShown && !revealing) {
@@ -1115,16 +1088,19 @@ static void ApplySizeMode(App& app) {
 }
 
 static void DrawMenuBar(App& app) {
-    yadua::ScanResult* r = app.Result.get();
-    const bool busy = app.Scanning || app.Deleting || app.Rescanning ||
-                      app.Applying;
-    uint32_t sel;
-    const bool hasSel = HasSelection(app, sel);
+    // A rescan mutates Result->Nodes in place on a worker thread (push_back can
+    // reallocate, Reindex reassigns Totals/Children), so we must NOT read node
+    // data while it runs. Treat "rescanning" as "no result" for node reads;
+    // the tab body is already gated the same way.
+    yadua::ScanResult* r = app.Rescanning ? nullptr : app.Result.get();
+    const bool busy = app.Scanning || app.Deleting || app.Rescanning;
+    uint32_t sel = UINT32_MAX;
+    const bool hasSel = !app.Rescanning && HasSelection(app, sel);
 
     if (!ImGui::BeginMenuBar()) return;
 
     if (ImGui::BeginMenu("File")) {
-        if (ImGui::MenuItem(r ? "Rescan" : "Scan", "Ctrl+R", false,
+        if (ImGui::MenuItem(app.Result ? "Rescan" : "Scan", "Ctrl+R", false,
                             !app.Drives.empty() && !busy))
             StartScan(app);
         if (ImGui::BeginMenu("Scan drive", !app.Drives.empty() && !busy)) {
@@ -1191,17 +1167,6 @@ static void DrawMenuBar(App& app) {
     }
 
     if (ImGui::BeginMenu("Tools")) {
-        const bool live = app.Monitor.Active() && !app.Monitor.Lost();
-        const uint64_t pending = live ? app.Monitor.Pending() : 0;
-        char applyLbl[64];
-        snprintf(applyLbl, sizeof(applyLbl), "Apply %llu filesystem change%s",
-                 (unsigned long long)pending, pending == 1 ? "" : "s");
-        if (ImGui::MenuItem(applyLbl, nullptr, false, pending > 0 && !busy))
-            StartApply(app);
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal | ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("Fold filesystem changes seen since the scan into "
-                              "the tree (via the NTFS change journal), without "
-                              "a full rescan.");
         const bool canRescan = hasSel && r->IsDir(sel) &&
                                !(r->Nodes[sel].Flags & yadua::kNodeReparse) &&
                                !busy;
@@ -1231,15 +1196,15 @@ static void DrawMenuBar(App& app) {
 
 // Global keyboard shortcuts mirrored from the menus.
 static void HandleShortcuts(App& app) {
-    const bool busy = app.Scanning || app.Deleting || app.Rescanning ||
-                      app.Applying;
+    const bool busy = app.Scanning || app.Deleting || app.Rescanning;
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_R) &&
         !app.Drives.empty() && !busy)
         StartScan(app);
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F))
         app.FocusFilter = true;
-    // Text-editing keys only act on nodes when no input box has focus.
-    if (!ImGui::GetIO().WantTextInput) {
+    // Text-editing keys only act on nodes when no input box has focus. Skip
+    // node reads during a rescan (Result is being mutated on a worker thread).
+    if (!ImGui::GetIO().WantTextInput && !app.Rescanning) {
         uint32_t sel;
         if (ImGui::IsKeyPressed(ImGuiKey_Delete) && HasSelection(app, sel) &&
             sel != (uint32_t)yadua::kRootRecord && !app.Deleting)
@@ -1283,14 +1248,30 @@ static void DrawUi(App& app) {
     ImGui::SameLine();
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14.0f);
     if (app.FocusFilter) { ImGui::SetKeyboardFocusHere(); app.FocusFilter = false; }
+    // The filter box does not recompute on every keystroke (that is O(all
+    // nodes) and made typing lag on big volumes). Instead an edit schedules a
+    // recompute that fires once typing has been idle briefly; Enter applies
+    // immediately.
     if (ImGui::InputTextWithHint("##filter", "filter: name  *.ext  >100mb",
-                                 app.Filter, sizeof(app.Filter)))
+                                 app.Filter, sizeof(app.Filter),
+                                 ImGuiInputTextFlags_EnterReturnsTrue)) {
+        app.FilterPending = false;
         RecomputeFilter(app);
+    }
+    if (ImGui::IsItemEdited()) {
+        app.FilterPending  = true;
+        app.FilterEditedAt = ImGui::GetTime();
+    }
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
         ImGui::SetTooltip("Space-separated terms (all must match):\n"
                           "  setup        name contains \"setup\"\n"
                           "  *.iso        extension filter (or ext:iso)\n"
-                          "  >100mb <2gb  size filter (b/kb/mb/gb/tb)");
+                          "  >100mb <2gb  size filter (b/kb/mb/gb/tb)\n"
+                          "Applies shortly after you stop typing, or on Enter.");
+    if (app.FilterPending && ImGui::GetTime() - app.FilterEditedAt >= 0.20) {
+        app.FilterPending = false;
+        RecomputeFilter(app);
+    }
 
     if (app.Result && !app.Rescanning) {
         ImGui::SameLine();
@@ -1307,22 +1288,6 @@ static void DrawUi(App& app) {
             ImGui::SetTooltip("Raw MFT access was unavailable (%s), so this "
                               "scan used the slower directory walk.",
                               yadua::Utf8(app.Result->FallbackReason).c_str());
-    }
-    // Live change tracking: a passive indicator here; the action lives in
-    // Tools > Apply filesystem changes.
-    if (app.Result && !app.Rescanning && !app.Applying && app.Monitor.Active()) {
-        ImGui::SameLine();
-        if (app.Monitor.Lost()) {
-            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f),
-                               "| live tracking lost - rescan");
-        } else {
-            uint64_t pending = app.Monitor.Pending();
-            ImGui::TextDisabled("| %llu change%s since scan", pending,
-                                pending == 1 ? "" : "s");
-            if (pending && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
-                ImGui::SetTooltip("Tools > Apply filesystem changes folds these "
-                                  "into the tree without a full rescan.");
-        }
     }
     if (!app.Status.empty()) {
         ImGui::SameLine();
@@ -1354,13 +1319,7 @@ static void DrawUi(App& app) {
     }
 
     // ---- Body ---------------------------------------------------------------
-    if (app.Applying) {
-        // ApplyMftUpdates is mutating Result on a worker thread.
-        ImGui::NewLine();
-        ImGui::TextUnformatted("Applying filesystem changes...");
-        ImGui::ProgressBar(-1.0f * (float)ImGui::GetTime(),
-                           ImVec2(ImGui::GetFontSize() * 25.0f, 0.0f));
-    } else if (app.Rescanning) {
+    if (app.Rescanning) {
         // The worker is mutating Result in place: render nothing that reads it.
         uint64_t found = app.RescanProgress.BytesRead.load(std::memory_order_relaxed);
         int stage = app.RescanProgress.Stage.load(std::memory_order_relaxed);
@@ -1577,9 +1536,13 @@ static UINT                    g_resizeHeight = 0;
 
 static void CreateRenderTarget() {
     ID3D11Texture2D* backBuffer = nullptr;
-    g_swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
-    g_d3dDevice->CreateRenderTargetView(backBuffer, nullptr, &g_renderTarget);
-    backBuffer->Release();
+    // GetBuffer can fail (device removed / occluded during a resize); don't
+    // dereference a null back-buffer.
+    if (SUCCEEDED(g_swapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer))) &&
+        backBuffer) {
+        g_d3dDevice->CreateRenderTargetView(backBuffer, nullptr, &g_renderTarget);
+        backBuffer->Release();
+    }
 }
 
 static void CleanupRenderTarget() {
@@ -1730,25 +1693,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
             }
         }
 
-        if (app.Applying && app.ApplyDone) {
-            app.ApplyThread.join();
-            app.Applying = false;
-            if (app.ApplyError.empty()) {
-                char buf[128];
-                snprintf(buf, sizeof(buf), "Applied %zu changes%s",
-                         app.ApplyCount,
-                         app.ApplyUnresolved ? " (some unresolved - rescan "
-                                               "for full accuracy)" : "");
-                app.Status = buf;
-                if (!app.Result->Exists(app.Treemap.Root())) app.Treemap.Reset();
-                app.Treemap.Invalidate();
-                app.UseSorted = false;
-                app.SortedChildren.clear();
-                RecomputeFilter(app);
-            } else {
-                app.Status = "Apply failed: " + yadua::Utf8(app.ApplyError);
-            }
-        }
         if (app.Rescanning && app.RescanDone) {
             app.RescanThread.join();
             app.Rescanning = false;
@@ -1773,11 +1717,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
                 app.Treemap.Reset();
                 app.Status.clear();
                 RecomputeFilter(app);
-                // Raw-MFT scans can track live changes via the USN journal.
-                if (!app.Result->MftMap.empty()) {
-                    std::wstring monErr;
-                    app.Monitor.Start(app.Result->Drive, monErr); // best effort
-                }
             } else {
                 app.Error = std::move(app.PendingError);
                 app.PendingError.clear();
@@ -1792,18 +1731,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
         DrawUi(app);
         ImGui::Render();
 
-        const float clear[4] = {0.06f, 0.06f, 0.07f, 1.0f};
-        g_d3dContext->OMSetRenderTargets(1, &g_renderTarget, nullptr);
-        g_d3dContext->ClearRenderTargetView(g_renderTarget, clear);
-        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        if (g_renderTarget) { // may be null if a resize's GetBuffer failed
+            const float clear[4] = {0.06f, 0.06f, 0.07f, 1.0f};
+            g_d3dContext->OMSetRenderTargets(1, &g_renderTarget, nullptr);
+            g_d3dContext->ClearRenderTargetView(g_renderTarget, clear);
+            ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        }
         g_swapChain->Present(1, 0); // vsync
     }
 
-    app.Monitor.Stop();
     if (app.ScanThread.joinable()) app.ScanThread.join();
     if (app.DeleteThread.joinable()) app.DeleteThread.join();
     if (app.RescanThread.joinable()) app.RescanThread.join();
-    if (app.ApplyThread.joinable()) app.ApplyThread.join();
     if (app.UpdCheckThread.joinable()) app.UpdCheckThread.join();
     if (app.UpdDownloadThread.joinable()) app.UpdDownloadThread.join();
     ImGui_ImplDX11_Shutdown();
