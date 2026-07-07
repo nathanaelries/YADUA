@@ -39,3 +39,17 @@ stamp version 0.0.0, which also disables the launch update check.
   with `CancelSynchronousIo`. Don't reintroduce sleep-polling.
 - The GUI deliberately does **not** use `UsnMonitor` (past hangs/crashes —
   see Phase 3 in `TODO.md`); it refreshes via Rescan instead.
+- **Accessibility invariants** (`ApplyStyle` in `src/gui.cpp`): all UI sizes
+  must be font-relative (`GetFontSize()` multiples), never hard pixels — the
+  user zoom (Ctrl+=/-) and per-monitor DPI both scale through it. New colors
+  must come from the theme (or a theme-aware helper like `StatusColor` /
+  `NameTint`), not hard-coded ImVec4s, and no information may be carried by
+  hue alone (the high-contrast themes drop tinting). Style changes go through
+  `app.StyleDirty` → `ApplyStyle` between frames — never mutate
+  `ImGui::GetStyle()` mid-frame, and never call `ScaleAllSizes` on the live
+  style (it compounds). Known gap: no UI Automation tree (screen readers);
+  the CLI is the screen-reader path.
+- Quick GUI test recipe: back up `%LOCALAPPDATA%\YADUA\settings.txt`, seed it
+  (e.g. `theme=2`, `uiScale=2.00`, `focusRing=1`), launch with
+  `__COMPAT_LAYER=RunAsInvoker`, screenshot, restore. The app writes settings
+  on exit, so always restore the backup afterwards.

@@ -130,6 +130,17 @@
       pre-Win10), and the USN reader blocks in the kernel instead of polling
       every second. Measured idle GUI: 6.7% of a core → 0%.
 
+- [x] Accessibility pass for low vision (ADA/WCAG-minded, aimed at e.g.
+      macular degeneration): crisp text/UI zoom 75–300% (Ctrl+= / Ctrl+- /
+      Ctrl+0, dynamic font re-rasterization, hit targets scale too), Light +
+      High-contrast dark/light themes (borders everywhere, readable
+      selection, no hue-only information — name tinting off in HC), Windows
+      high-contrast mode auto-detected on first run, full keyboard navigation
+      with an optional always-visible focus ring, theme-aware status colors,
+      per-monitor DPI rescaling (WM_DPICHANGED). All persisted in
+      settings.txt. Known gap: no UI Automation tree yet (screen readers) —
+      the CLI is the screen-reader-friendly path; documented in README.
+
 ## Phase 4 — WizTree / WinDirStat competitive parity
 
 - [x] "Size on disk" (allocated) toggle: View menu flips the tree, treemap,

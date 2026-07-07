@@ -51,6 +51,17 @@ enum TreeColumn : ImGuiID {
     ColAllocated, ColAttributes
 };
 
+// View > Theme choices. The high-contrast pair targets low-vision use:
+// WCAG-level contrast, borders everywhere, a loud focus ring, and no
+// information carried by hue alone. Windows high-contrast mode auto-selects
+// one on first run (see wWinMain).
+enum : int {
+    kThemeDark = 0, kThemeLight = 1, kThemeHCDark = 2, kThemeHCLight = 3,
+    kThemeCount = 4
+};
+static const char* const kThemeNames[kThemeCount] = {
+    "Dark", "Light", "High contrast dark", "High contrast light"};
+
 // Win32 file attributes as compact letters (WizTree-style): Read-only, Hidden,
 // System, Archive, Compressed, Encrypted. Empty when none are set.
 static std::string AttrString(uint32_t a) {
@@ -153,6 +164,14 @@ struct App {
     // full-screen view); height is user-draggable via a splitter.
     bool  ShowMapPanel   = true;
     float MapPanelHeight = 0; // 0 = pick a default on first layout
+
+    // ---- Accessibility / appearance (persisted; see ApplyStyle) -----------
+    int   Theme             = kThemeDark;
+    float UiScale           = 1.0f;  // user text/UI zoom, on top of DpiScale
+    bool  FocusRingAlways   = false; // keyboard-focus ring always visible
+    bool  ThemeFromSettings = false; // a saved choice beats HC auto-detect
+    float DpiScale          = 1.0f;  // monitor scale (WM_DPICHANGED updates)
+    bool  StyleDirty        = false; // ApplyStyle before the next frame
 
     // Recycle-bin deletion (one at a time, on a background thread because the
     // shell can take a while on big folders).
@@ -618,6 +637,16 @@ static void LoadSettings(App& app) {
         if (key == "checkOnLaunch")       app.UpdCheckOnLaunch = (val != "0");
         else if (key == "skip")           app.UpdSkipVersion = yadua::Wide(val);
         else if (key == "showAllocated")  app.ShowAllocated = (val != "0");
+        else if (key == "theme") {
+            app.Theme = atoi(val.c_str());
+            if (app.Theme < 0 || app.Theme >= kThemeCount) app.Theme = kThemeDark;
+            app.ThemeFromSettings = true;
+        }
+        else if (key == "uiScale") {
+            app.UiScale = (float)atof(val.c_str());
+            if (app.UiScale < 0.75f || app.UiScale > 3.0f) app.UiScale = 1.0f;
+        }
+        else if (key == "focusRing")      app.FocusRingAlways = (val != "0");
         else if (key == "drive")          app.LastDrive = yadua::Wide(val);
         else if (key == "win")
             sscanf(val.c_str(), "%d,%d,%d,%d", &app.WinX, &app.WinY, &app.WinW,
@@ -634,11 +663,170 @@ static void SaveSettings(App& app) {
     fprintf(f, "checkOnLaunch=%d\n", app.UpdCheckOnLaunch ? 1 : 0);
     fprintf(f, "skip=%s\n", yadua::Utf8(app.UpdSkipVersion).c_str());
     fprintf(f, "showAllocated=%d\n", app.ShowAllocated ? 1 : 0);
+    if (app.ThemeFromSettings) fprintf(f, "theme=%d\n", app.Theme);
+    fprintf(f, "uiScale=%.2f\n", app.UiScale);
+    fprintf(f, "focusRing=%d\n", app.FocusRingAlways ? 1 : 0);
     if (!app.LastDrive.empty())
         fprintf(f, "drive=%s\n", yadua::Utf8(app.LastDrive).c_str());
     if (app.WinW > 0 && app.WinH > 0)
         fprintf(f, "win=%d,%d,%d,%d\n", app.WinX, app.WinY, app.WinW, app.WinH);
     fclose(f);
+}
+
+// ============================================================================
+// Appearance: themes, text-size zoom, DPI (accessibility)
+// ============================================================================
+
+// Rebuilds the ImGui style + font scaling from the current theme, monitor
+// DPI, and user zoom. Always starts from a fresh ImGuiStyle: ScaleAllSizes is
+// destructive, so rescaling the live style would compound rounding on every
+// change. Fonts re-rasterize at the final size (dynamic atlas), so zoom stays
+// crisp instead of stretching bitmaps.
+static void ApplyStyle(App& app) {
+    ImGuiStyle style;
+    ImVec4* c = style.Colors;
+    switch (app.Theme) {
+        case kThemeLight:
+            ImGui::StyleColorsLight(&style);
+            break;
+        case kThemeHCDark: {
+            // White-on-black text (21:1); deep-blue selection keeps white
+            // text readable (~7:1); yellow marks focus and accents only.
+            ImGui::StyleColorsDark(&style);
+            const ImVec4 black(0, 0, 0, 1), white(1, 1, 1, 1);
+            const ImVec4 select(0.00f, 0.30f, 0.85f, 1.0f);
+            const ImVec4 accent(1.00f, 1.00f, 0.00f, 1.0f);
+            c[ImGuiCol_Text]           = white;
+            c[ImGuiCol_TextDisabled]   = ImVec4(0.75f, 0.75f, 0.75f, 1);
+            c[ImGuiCol_WindowBg] = c[ImGuiCol_ChildBg] = c[ImGuiCol_PopupBg] = black;
+            c[ImGuiCol_MenuBarBg] = c[ImGuiCol_TitleBg] = c[ImGuiCol_TitleBgActive] = black;
+            c[ImGuiCol_Border]         = white;
+            c[ImGuiCol_FrameBg]        = ImVec4(0.12f, 0.12f, 0.12f, 1);
+            c[ImGuiCol_FrameBgHovered] = ImVec4(0.25f, 0.25f, 0.25f, 1);
+            c[ImGuiCol_FrameBgActive]  = ImVec4(0.35f, 0.35f, 0.35f, 1);
+            c[ImGuiCol_Header]         = select;
+            c[ImGuiCol_HeaderHovered]  = ImVec4(0.10f, 0.40f, 0.95f, 1);
+            c[ImGuiCol_HeaderActive]   = ImVec4(0.20f, 0.50f, 1.00f, 1);
+            c[ImGuiCol_Button]         = ImVec4(0.12f, 0.12f, 0.12f, 1);
+            c[ImGuiCol_ButtonHovered]  = select;
+            c[ImGuiCol_ButtonActive]   = ImVec4(0.20f, 0.50f, 1.00f, 1);
+            c[ImGuiCol_Tab]            = black;
+            c[ImGuiCol_TabHovered]     = select;
+            c[ImGuiCol_TabSelected]    = select;
+            c[ImGuiCol_TabSelectedOverline] = accent;
+            c[ImGuiCol_CheckMark]      = accent;
+            c[ImGuiCol_SliderGrab] = c[ImGuiCol_SliderGrabActive] = accent;
+            c[ImGuiCol_SeparatorHovered] = c[ImGuiCol_SeparatorActive] = accent;
+            c[ImGuiCol_ScrollbarBg]    = black;
+            c[ImGuiCol_ScrollbarGrab]  = ImVec4(0.60f, 0.60f, 0.60f, 1);
+            c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.80f, 0.80f, 0.80f, 1);
+            c[ImGuiCol_ScrollbarGrabActive]  = accent;
+            c[ImGuiCol_TableHeaderBg]  = ImVec4(0.15f, 0.15f, 0.15f, 1);
+            c[ImGuiCol_TableBorderStrong] = ImVec4(0.80f, 0.80f, 0.80f, 1);
+            c[ImGuiCol_TableBorderLight]  = ImVec4(0.50f, 0.50f, 0.50f, 1);
+            c[ImGuiCol_TextSelectedBg] = select;
+            // % bars: the white overlay text must stay readable on the fill.
+            c[ImGuiCol_PlotHistogram]  = ImVec4(0.00f, 0.35f, 0.90f, 1);
+            c[ImGuiCol_NavCursor]      = accent;
+            style.FrameBorderSize  = 1.0f;
+            style.WindowBorderSize = 1.0f;
+            style.PopupBorderSize  = 1.0f;
+            style.TabBorderSize    = 1.0f;
+            style.ScrollbarSize    = 18.0f; // bigger grab target (pre-scale)
+            break;
+        }
+        case kThemeHCLight: {
+            // Black-on-white; selection is pale yellow so black text stays
+            // ~15:1; the focus ring is magenta, loud on both white and the
+            // yellow selection.
+            ImGui::StyleColorsLight(&style);
+            const ImVec4 white(1, 1, 1, 1), black(0, 0, 0, 1);
+            const ImVec4 select(1.00f, 0.92f, 0.35f, 1.0f);
+            const ImVec4 accent(0.00f, 0.15f, 0.75f, 1.0f);
+            c[ImGuiCol_Text]           = black;
+            c[ImGuiCol_TextDisabled]   = ImVec4(0.30f, 0.30f, 0.30f, 1);
+            c[ImGuiCol_WindowBg] = c[ImGuiCol_ChildBg] = c[ImGuiCol_PopupBg] = white;
+            c[ImGuiCol_MenuBarBg] = c[ImGuiCol_TitleBg] = c[ImGuiCol_TitleBgActive] = white;
+            c[ImGuiCol_Border]         = black;
+            c[ImGuiCol_FrameBg]        = ImVec4(0.93f, 0.93f, 0.93f, 1);
+            c[ImGuiCol_FrameBgHovered] = ImVec4(0.85f, 0.85f, 0.85f, 1);
+            c[ImGuiCol_FrameBgActive]  = ImVec4(0.78f, 0.78f, 0.78f, 1);
+            c[ImGuiCol_Header]         = select;
+            c[ImGuiCol_HeaderHovered]  = ImVec4(1.00f, 0.96f, 0.55f, 1);
+            c[ImGuiCol_HeaderActive]   = ImVec4(0.95f, 0.85f, 0.20f, 1);
+            c[ImGuiCol_Button]         = ImVec4(0.93f, 0.93f, 0.93f, 1);
+            c[ImGuiCol_ButtonHovered]  = select;
+            c[ImGuiCol_ButtonActive]   = ImVec4(0.95f, 0.85f, 0.20f, 1);
+            c[ImGuiCol_Tab]            = white;
+            c[ImGuiCol_TabHovered]     = select;
+            c[ImGuiCol_TabSelected]    = select;
+            c[ImGuiCol_TabSelectedOverline] = accent;
+            c[ImGuiCol_CheckMark]      = black;
+            c[ImGuiCol_SliderGrab] = c[ImGuiCol_SliderGrabActive] = accent;
+            c[ImGuiCol_SeparatorHovered] = c[ImGuiCol_SeparatorActive] = accent;
+            c[ImGuiCol_ScrollbarBg]    = white;
+            c[ImGuiCol_ScrollbarGrab]  = ImVec4(0.45f, 0.45f, 0.45f, 1);
+            c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.25f, 0.25f, 0.25f, 1);
+            c[ImGuiCol_ScrollbarGrabActive]  = accent;
+            c[ImGuiCol_TableHeaderBg]  = ImVec4(0.88f, 0.88f, 0.88f, 1);
+            c[ImGuiCol_TableBorderStrong] = ImVec4(0.20f, 0.20f, 0.20f, 1);
+            c[ImGuiCol_TableBorderLight]  = ImVec4(0.55f, 0.55f, 0.55f, 1);
+            c[ImGuiCol_TextSelectedBg] = select;
+            // % bars: pale blue fill so the black overlay text stays readable.
+            c[ImGuiCol_PlotHistogram]  = ImVec4(0.55f, 0.75f, 1.00f, 1);
+            c[ImGuiCol_NavCursor]      = ImVec4(0.75f, 0.00f, 0.75f, 1);
+            style.FrameBorderSize  = 1.0f;
+            style.WindowBorderSize = 1.0f;
+            style.PopupBorderSize  = 1.0f;
+            style.TabBorderSize    = 1.0f;
+            style.ScrollbarSize    = 18.0f;
+            break;
+        }
+        default:
+            ImGui::StyleColorsDark(&style);
+            break;
+    }
+    // Geometry (padding, spacing, scrollbars, hit targets) scales with
+    // DPI x user zoom; fonts run through the same factors but re-rasterize.
+    style.ScaleAllSizes(app.DpiScale * app.UiScale);
+    style.FontSizeBase  = 17.0f;
+    style.FontScaleDpi  = app.DpiScale;
+    style.FontScaleMain = app.UiScale;
+    ImGui::GetStyle() = style;
+    ImGui::GetIO().ConfigNavCursorVisibleAlways = app.FocusRingAlways;
+    app.StyleDirty = false;
+}
+
+// Browser-style text-size zoom; hit targets scale along with the glyphs.
+static void SetUiScale(App& app, float s) {
+    s = s < 0.75f ? 0.75f : (s > 3.0f ? 3.0f : s);
+    if (s == app.UiScale) return;
+    app.UiScale    = s;
+    app.StyleDirty = true;
+    SaveSettings(app);
+}
+
+// Theme-aware "good news" green for the status line + update banner; a fixed
+// light green washes out on light backgrounds.
+static ImVec4 StatusColor(const App& app) {
+    switch (app.Theme) {
+        case kThemeLight:   return ImVec4(0.00f, 0.45f, 0.00f, 1.0f);
+        case kThemeHCDark:  return ImVec4(0.30f, 1.00f, 0.30f, 1.0f);
+        case kThemeHCLight: return ImVec4(0.00f, 0.35f, 0.00f, 1.0f);
+        default:            return ImVec4(0.55f, 0.85f, 0.55f, 1.0f);
+    }
+}
+
+// File-name tint: the treemap's extension hue, adapted so the text keeps
+// readable contrast on each theme. The high-contrast themes skip the tint
+// entirely (type still reads via the File Types view and treemap legend).
+static ImU32 NameTint(const App& app, const yadua::ScanResult& r, uint32_t idx) {
+    switch (app.Theme) {
+        case kThemeLight:   return ExtensionColor(r, idx, 0.85f, 0.45f);
+        case kThemeHCDark:
+        case kThemeHCLight: return ImGui::GetColorU32(ImGuiCol_Text);
+        default:            return ExtensionColor(r, idx, 0.40f, 0.95f);
+    }
 }
 
 // Load user-defined right-click commands from %LOCALAPPDATA%\YADUA\commands.txt.
@@ -863,10 +1051,9 @@ static void DrawTree(App& app, const yadua::ScanResult& r, uint32_t idx,
     if (r.Nodes[idx].Flags & yadua::kNodeReparse)
         label += "  [link]"; // junction / symlink / cloud placeholder
     // Tint file names by extension with the same hue the treemap uses, so
-    // the two views read consistently.
+    // the two views read consistently (theme-adapted, see NameTint).
     if (!isDir)
-        ImGui::PushStyleColor(ImGuiCol_Text,
-                              ExtensionColor(r, idx, 0.40f, 0.95f));
+        ImGui::PushStyleColor(ImGuiCol_Text, NameTint(app, r, idx));
     bool open = ImGui::TreeNodeEx((void*)(intptr_t)idx, flags, "%s", label.c_str());
     if (!isDir) ImGui::PopStyleColor();
     if (idx == app.RevealNode) ImGui::SetScrollHereY(0.35f);
@@ -1190,8 +1377,7 @@ static void DrawFilesTab(App& app, const yadua::ScanResult& r) {
             ImGui::PushID((int)idx);
 
             ImGui::TableSetColumnIndex(0);
-            ImGui::PushStyleColor(ImGuiCol_Text,
-                                  ExtensionColor(r, idx, 0.40f, 0.95f));
+            ImGui::PushStyleColor(ImGuiCol_Text, NameTint(app, r, idx));
             if (ImGui::Selectable(yadua::Utf8(r.Name(idx)).c_str(),
                                   idx == app.SelectedNode,
                                   ImGuiSelectableFlags_SpanAllColumns))
@@ -1603,6 +1789,47 @@ static void DrawMenuBar(App& app) {
         ImGui::MenuItem("Treemap panel", nullptr, &app.ShowMapPanel);
         ImGui::MenuItem("Treemap cushion shading", nullptr, &app.Treemap.Cushion);
         ImGui::Separator();
+        char zoom[32];
+        snprintf(zoom, sizeof(zoom), "Text size: %d%%",
+                 (int)(app.UiScale * 100.0f + 0.5f));
+        if (ImGui::BeginMenu(zoom)) {
+            if (ImGui::MenuItem("Increase", "Ctrl+=", false, app.UiScale < 3.0f))
+                SetUiScale(app, app.UiScale + 0.25f);
+            if (ImGui::MenuItem("Decrease", "Ctrl+-", false, app.UiScale > 0.75f))
+                SetUiScale(app, app.UiScale - 0.25f);
+            ImGui::Separator();
+            static const float kZoomPresets[] = {1.0f, 1.25f, 1.5f,
+                                                 2.0f, 2.5f,  3.0f};
+            for (float s : kZoomPresets) {
+                char lbl[16];
+                snprintf(lbl, sizeof(lbl), "%d%%", (int)(s * 100.0f + 0.5f));
+                if (ImGui::MenuItem(lbl, s == 1.0f ? "Ctrl+0" : nullptr,
+                                    app.UiScale == s))
+                    SetUiScale(app, s);
+            }
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Theme")) {
+            for (int t = 0; t < kThemeCount; ++t)
+                if (ImGui::MenuItem(kThemeNames[t], nullptr, app.Theme == t) &&
+                    app.Theme != t) {
+                    app.Theme            = t;
+                    app.ThemeFromSettings = true;
+                    app.StyleDirty       = true;
+                    SaveSettings(app);
+                }
+            ImGui::EndMenu();
+        }
+        if (ImGui::MenuItem("Always show keyboard focus", nullptr,
+                            app.FocusRingAlways)) {
+            app.FocusRingAlways = !app.FocusRingAlways;
+            app.StyleDirty      = true;
+            SaveSettings(app);
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+            ImGui::SetTooltip("Keep the keyboard-navigation cursor visible at\n"
+                              "all times; Tab and the arrow keys move it.");
+        ImGui::Separator();
         ImGui::BeginDisabled(!r);
         if (ImGui::MenuItem("Tree"))       app.SwitchToTree = true;
         if (ImGui::MenuItem("Files"))      app.SwitchToFiles = true;
@@ -1659,6 +1886,16 @@ static void HandleShortcuts(App& app) {
         StartScan(app);
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_F))
         app.FocusFilter = true;
+    // Browser-style text-size zoom (works even while typing in the filter).
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Equal) ||
+        ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_KeypadAdd))
+        SetUiScale(app, app.UiScale + 0.25f);
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Minus) ||
+        ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_KeypadSubtract))
+        SetUiScale(app, app.UiScale - 0.25f);
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_0) ||
+        ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Keypad0))
+        SetUiScale(app, 1.0f);
     // Text-editing keys only act on nodes when no input box has focus. Skip
     // node reads during a rescan (Result is being mutated on a worker thread).
     if (!ImGui::GetIO().WantTextInput && !app.Rescanning) {
@@ -1783,14 +2020,13 @@ static void DrawUi(App& app) {
     }
     if (!app.Status.empty()) {
         ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1.0f), "| %s",
-                           app.Status.c_str());
+        ImGui::TextColored(StatusColor(app), "| %s", app.Status.c_str());
     }
     ImGui::Separator();
 
     // ---- Update banner ------------------------------------------------------
     if (UpdateBannerVisible(app) && !app.UpdDownloading) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f, 0.85f, 0.60f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, StatusColor(app));
         ImGui::Text("Update available: YADUA %s",
                     yadua::Utf8(app.UpdInfo.Version).c_str());
         ImGui::PopStyleColor();
@@ -2043,6 +2279,7 @@ static IDXGISwapChain*         g_swapChain    = nullptr;
 static ID3D11RenderTargetView* g_renderTarget = nullptr;
 static UINT                    g_resizeWidth  = 0;
 static UINT                    g_resizeHeight = 0;
+static float                   g_dpiChanged   = 0.0f; // WM_DPICHANGED -> loop
 
 static void CreateRenderTarget() {
     ID3D11Texture2D* backBuffer = nullptr;
@@ -2116,6 +2353,16 @@ static LRESULT WINAPI WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_SYSCOMMAND:
             if ((wp & 0xFFF0) == SC_KEYMENU) return 0; // disable ALT menu
             break;
+        case WM_DPICHANGED: {
+            // Moved to a monitor with a different scale: adopt the suggested
+            // rect now; the main loop rescales style + fonts before the next
+            // frame (see ApplyStyle).
+            g_dpiChanged = (float)HIWORD(wp) / 96.0f;
+            const RECT* r = (const RECT*)lp;
+            SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left,
+                         r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
+            return 0;
+        }
         case WM_DESTROY:
             PostQuitMessage(0);
             return 0;
@@ -2137,6 +2384,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
     ListFixedDrives(app);
     LoadSettings(app);
     LoadUserCommands(app);
+    // Windows high-contrast mode: adopt the matching high-contrast theme
+    // unless the user has explicitly picked a theme before.
+    if (!app.ThemeFromSettings) {
+        HIGHCONTRASTW hc{sizeof(hc)};
+        if (SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(hc), &hc, 0) &&
+            (hc.dwFlags & HCF_HIGHCONTRASTON)) {
+            DWORD w = GetSysColor(COLOR_WINDOW);
+            app.Theme = (GetRValue(w) + GetGValue(w) + GetBValue(w) > 384)
+                            ? kThemeHCLight : kThemeHCDark;
+        }
+    }
     // Restore the last-scanned drive.
     if (!app.LastDrive.empty())
         for (int i = 0; i < (int)app.Drives.size(); ++i)
@@ -2173,13 +2431,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr; // no imgui.ini clutter next to the exe
+    // Full keyboard navigation (Tab + arrows + Space/Enter): mouse targeting
+    // is hard with low vision, so everything must be reachable by keyboard.
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
-    float scale = ImGui_ImplWin32_GetDpiScaleForHwnd(hwnd);
-    ImGui::StyleColorsDark();
-    ImGui::GetStyle().ScaleAllSizes(scale);
-    ImFont* font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf",
-                                                17.0f * scale);
+    app.DpiScale = ImGui_ImplWin32_GetDpiScaleForHwnd(hwnd);
+    // No pixel size here: the dynamic font atlas rasterizes glyphs at
+    // FontSizeBase x FontScaleDpi x FontScaleMain (set in ApplyStyle), so
+    // DPI changes and the user's text-size zoom stay crisp.
+    ImFont* font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf");
     if (!font) io.Fonts->AddFontDefault();
+    ApplyStyle(app); // theme + DPI + saved zoom
 
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_d3dDevice, g_d3dContext);
@@ -2312,6 +2574,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
         if (IsIconic(hwnd)) { settleFrames = 0; continue; }
         if (settleFrames > 0) --settleFrames;
 
+        if (g_dpiChanged != 0.0f) { // window moved to a different-DPI monitor
+            app.DpiScale   = g_dpiChanged;
+            g_dpiChanged   = 0.0f;
+            app.StyleDirty = true;
+        }
+        if (app.StyleDirty) ApplyStyle(app); // theme / zoom / DPI changed
+
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
@@ -2319,7 +2588,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
         ImGui::Render();
 
         if (g_renderTarget) { // may be null if a resize's GetBuffer failed
-            const float clear[4] = {0.06f, 0.06f, 0.07f, 1.0f};
+            const ImVec4& bg = ImGui::GetStyle().Colors[ImGuiCol_WindowBg];
+            const float clear[4] = {bg.x, bg.y, bg.z, 1.0f};
             g_d3dContext->OMSetRenderTargets(1, &g_renderTarget, nullptr);
             g_d3dContext->ClearRenderTargetView(g_renderTarget, clear);
             ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());

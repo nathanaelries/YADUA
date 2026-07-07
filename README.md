@@ -85,6 +85,37 @@ Enter), so typing stays responsive even on multi-million-file volumes. Rescan
 (or *Tools ▸ Rescan selected folder*) to pick up filesystem changes since the
 scan.
 
+## Accessibility (low vision)
+
+Built for use with impaired central vision (e.g. macular degeneration):
+
+- **Text size** — *View ▸ Text size* or `Ctrl+=` / `Ctrl+-` / `Ctrl+0`
+  (75%–300%, remembered). Zoom re-rasterizes the font and scales every
+  control and hit target with it, so text stays sharp at any size — nothing
+  is bitmap-stretched. Works alongside Windows display scaling, and the UI
+  rescales itself when dragged between monitors with different DPI.
+- **Themes** — *View ▸ Theme*: Dark, Light, **High contrast dark** (white on
+  black, 21:1), and **High contrast light** (black on white). The
+  high-contrast themes put borders on every control, use selection colors
+  chosen to keep text readable, and never encode information by hue alone
+  (file-type name tinting is disabled there). When Windows high-contrast
+  mode is on, a matching high-contrast theme is selected automatically on
+  first run.
+- **Keyboard-only operation** — full keyboard navigation: `Tab` / arrow keys
+  move focus, `Space`/`Enter` activate, `Alt` reaches the menu bar, and all
+  actions live in the menus with shortcuts (`Ctrl+R` scan, `Ctrl+F` find,
+  `Del` recycle, `Esc` clear filter). *View ▸ Always show keyboard focus*
+  keeps a bright focus ring visible at all times (yellow on the dark themes,
+  magenta on high-contrast light).
+- **Percentages are text, not just bars** — every percent bar carries a
+  numeric overlay, and sizes/dates/counts are plain text columns.
+- **Screen readers** — the GUI paints its own pixels (Dear ImGui) and does
+  not yet expose a UI Automation tree, so Narrator/NVDA cannot read it; this
+  is the known accessibility gap. The **CLI works well with screen readers**:
+  `yadua.exe C:` prints the same top-folders/files report as plain console
+  text, and `--json` / CSV exports feed any tooling. Windows Magnifier works
+  normally with the GUI.
+
 ## Scan modes
 
 NTFS volumes scanned from an elevated process use the fast raw-MFT path.
