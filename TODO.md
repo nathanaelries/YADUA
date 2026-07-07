@@ -123,6 +123,13 @@
         (std::terminate); a shared error flag + join scope-guard make the others
         exit cleanly (no deadlock) and the scan reports the failure
 
+- [x] Energy-efficiency pass: the GUI renders on demand instead of spinning
+      at monitor refresh rate (blocks in `MsgWaitForMultipleObjectsEx` when
+      idle, ~30 fps only while background work animates, skips frames while
+      minimized), flip-model swap chain (`FLIP_DISCARD`, blt fallback for
+      pre-Win10), and the USN reader blocks in the kernel instead of polling
+      every second. Measured idle GUI: 6.7% of a core → 0%.
+
 ## Phase 4 — WizTree / WinDirStat competitive parity
 
 - [x] "Size on disk" (allocated) toggle: View menu flips the tree, treemap,

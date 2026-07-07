@@ -1537,7 +1537,15 @@ bool UsnMonitor::Start(const std::wstring& drive, std::wstring& error) {
 
 void UsnMonitor::Stop() {
     stop_ = true;
-    if (thread_.joinable()) thread_.join();
+    if (thread_.joinable()) {
+        // The reader blocks inside FSCTL_READ_USN_JOURNAL until journal data
+        // arrives; cancel that wait. One cancel can race the gap between two
+        // reads (nothing in flight yet), so repeat until the thread exits.
+        HANDLE th = (HANDLE)thread_.native_handle();
+        while (WaitForSingleObject(th, 50) == WAIT_TIMEOUT)
+            CancelSynchronousIo(th);
+        thread_.join();
+    }
     if (volume_) {
         CloseHandle((HANDLE)volume_);
         volume_ = nullptr;
@@ -1560,11 +1568,16 @@ void UsnMonitor::Loop() {
         request.StartUsn          = nextUsn_;
         request.ReasonMask        = 0xFFFFFFFF;
         request.UsnJournalID      = journalId_;
-        // BytesToWaitFor == 0: return immediately with whatever is available.
+        // Block in the kernel until at least one new record exists (Timeout
+        // 0 = wait indefinitely): zero wakeups and no volume touches while
+        // the disk is quiet. Stop() breaks the wait with CancelSynchronousIo.
+        request.BytesToWaitFor    = 1;
+        request.Timeout           = 0;
         DWORD bytes = 0;
         if (!DeviceIoControl((HANDLE)volume_, FSCTL_READ_USN_JOURNAL,
                              &request, sizeof(request), buffer.data(),
                              (DWORD)buffer.size(), &bytes, nullptr)) {
+            if (stop_) return; // Stop() canceled the blocking read
             // Journal wrapped past our cursor, was deleted, or the volume
             // went away: incremental tracking is no longer sound.
             lost_ = true;
@@ -1592,9 +1605,6 @@ void UsnMonitor::Loop() {
             }
             pending_ = dirty_.size();
         }
-        // Nothing more to read right now (or a tiny batch): poll politely.
-        for (int i = 0; i < 10 && !stop_; ++i)
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 }
 

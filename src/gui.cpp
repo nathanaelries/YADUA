@@ -2067,19 +2067,28 @@ static bool CreateDeviceD3D(HWND hwnd) {
     sd.OutputWindow     = hwnd;
     sd.SampleDesc.Count = 1;
     sd.Windowed         = TRUE;
-    sd.SwapEffect       = DXGI_SWAP_EFFECT_DISCARD;
+    // Flip model presents without the legacy blt path's extra copy through
+    // DWM (and can go through hardware overlay planes), so each frame costs
+    // less GPU power. Requires Windows 10; the retry below covers older OSes.
+    sd.SwapEffect       = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 
     D3D_FEATURE_LEVEL level;
     const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_0,
                                         D3D_FEATURE_LEVEL_10_0};
-    HRESULT hr = D3D11CreateDeviceAndSwapChain(
-        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, levels, 2,
-        D3D11_SDK_VERSION, &sd, &g_swapChain, &g_d3dDevice, &level, &g_d3dContext);
+    auto create = [&](D3D_DRIVER_TYPE driver) {
+        return D3D11CreateDeviceAndSwapChain(
+            nullptr, driver, nullptr, 0, levels, 2, D3D11_SDK_VERSION, &sd,
+            &g_swapChain, &g_d3dDevice, &level, &g_d3dContext);
+    };
+    HRESULT hr = create(D3D_DRIVER_TYPE_HARDWARE);
     if (hr == DXGI_ERROR_UNSUPPORTED) // e.g. RDP / VMs without GPU
-        hr = D3D11CreateDeviceAndSwapChain(
-            nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, levels, 2,
-            D3D11_SDK_VERSION, &sd, &g_swapChain, &g_d3dDevice, &level,
-            &g_d3dContext);
+        hr = create(D3D_DRIVER_TYPE_WARP);
+    if (FAILED(hr)) { // pre-Win10: no flip model
+        sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+        hr = create(D3D_DRIVER_TYPE_HARDWARE);
+        if (hr == DXGI_ERROR_UNSUPPORTED)
+            hr = create(D3D_DRIVER_TYPE_WARP);
+    }
     if (FAILED(hr)) return false;
     CreateRenderTarget();
     return true;
@@ -2179,12 +2188,31 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
     app.OpenTreemap = cmdLine && wcsstr(cmdLine, L"--view treemap") != nullptr;
 
     bool done = false;
+    // Power: don't spin at monitor refresh rate when nothing changes. Sleep
+    // until something can affect the UI, then render a few frames so ImGui's
+    // hover/active state settles. Waits, longest applicable first:
+    //   INFINITE - fully idle; only a window message wakes us
+    //   250 ms   - a text field is active (caret blink)
+    //   100 ms   - mouse is over the window (delay-based tooltips)
+    //   33 ms    - background work / debounce pending (progress animation)
+    int settleFrames = 3;
     while (!done) {
+        bool working = app.Scanning || app.Rescanning || app.Deleting ||
+                       app.Exporting || app.UpdChecking || app.UpdDownloading;
+        DWORD wait = INFINITE;
+        if (settleFrames > 0)                  wait = 0;
+        else if (working || app.FilterPending) wait = 33;
+        else if (ImGui::GetIO().WantTextInput) wait = 250;
+        else if (ImGui::IsMousePosValid())     wait = 100;
+        MsgWaitForMultipleObjectsEx(0, nullptr, wait, QS_ALLINPUT,
+                                    MWMO_INPUTAVAILABLE);
+
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
             if (msg.message == WM_QUIT) done = true;
+            settleFrames = 3;
         }
         if (done) break;
 
@@ -2277,6 +2305,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR cmdLine, int) {
         }
 
         if (done) break; // e.g. update installer just launched
+
+        // Minimized: nothing is visible, so skip building and presenting a
+        // frame entirely (the top of the loop still drains messages and joins
+        // finished workers). Restoring generates messages, which re-renders.
+        if (IsIconic(hwnd)) { settleFrames = 0; continue; }
+        if (settleFrames > 0) --settleFrames;
 
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
